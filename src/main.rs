@@ -1,4 +1,3 @@
-#![feature(async_closure)]
 //! Demonstrate the use of a blocking `Delay` using the SYST (sysclock) timer.
 
 #![allow(clippy::empty_loop)]
