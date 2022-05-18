@@ -6,10 +6,19 @@
 #![no_std]
 
 use crate::futures::NbFuture;
+use crate::hal::timer::TimerExt;
+use bmp388::SamplingRate;
+use bmp388::BMP388;
 use cassette::pin_mut;
 use cassette::Cassette;
+use cortex_m::interrupt::CriticalSection;
 use cortex_m::interrupt::Mutex;
+use cortex_m_semihosting::hprintln;
+use hal::gpio::Pin;
+use hal::i2c::I2c;
 use hal::timer::CounterHz;
+use hal::timer::CounterMs;
+use libm::pow;
 
 use core::cell::RefCell;
 use core::panic::PanicInfo;
@@ -17,26 +26,18 @@ use hal::gpio;
 use hal::gpio::Output;
 use hal::gpio::PushPull;
 use hal::gpio::Speed;
-use logger::get_serial;
-use logger::setup_usb;
-use logger::write_to::show;
 
 use crate::hal::{pac, prelude::*};
 use cortex_m_rt::entry;
-use smart_leds::SmartLedsWrite;
-use smart_leds::RGB8;
 use stm32f4xx_hal as hal;
-use ws2812_timer_delay::Ws2812;
 
 mod futures;
-mod logger;
-
 // SAFETY: It's properly Mutex'd and RefCell'd, so everything should be fine
-static mut ERROR_LED: Option<Mutex<RefCell<gpio::Pin<Output<PushPull>, 'C', 1>>>> = None;
+static mut ERROR_LED: Option<Mutex<RefCell<gpio::Pin<'C', 13, Output<PushPull>>>>> = None;
 
 #[entry]
-fn main() -> ! {
-    let x = prog_main();
+fn entry_point() -> ! {
+    let x = main();
     pin_mut!(x);
     let mut cm = Cassette::new(x);
     loop {
@@ -44,186 +45,101 @@ fn main() -> ! {
             break;
         }
     }
-    cortex_m::interrupt::free(|cs| unsafe {
-        ERROR_LED
-            .as_ref()
-            .unwrap()
-            .borrow(cs)
-            .borrow_mut()
-            .set_low();
-    });
     loop {}
 }
 
-async fn blink_led(timer: &mut CounterHz<pac::TIM3>) {
-    timer.start(1.Hz()).unwrap();
-    loop {
-        NbFuture::new(|| timer.wait()).await.unwrap();
-
-        cortex_m::interrupt::free(|cs| unsafe {
-            ERROR_LED
-                .as_ref()
-                .unwrap()
-                .borrow(cs)
-                .borrow_mut()
-                .set_low();
-        });
-        NbFuture::new(|| timer.wait()).await.unwrap();
-        cortex_m::interrupt::free(|cs| unsafe {
-            ERROR_LED
-                .as_ref()
-                .unwrap()
-                .borrow(cs)
-                .borrow_mut()
-                .set_high();
-        });
-        //show("Hello, world!");
-    }
-}
-
-async fn prog_main() {
+async fn main() {
     if let (Some(dp), Some(cp)) = (
         pac::Peripherals::take(),
         cortex_m::peripheral::Peripherals::take(),
     ) {
-        let gpioc = dp.GPIOC.split();
-        let mut led = gpioc.pc1.into_push_pull_output();
-        led.set_high();
-        // SAFETY: error_led is only mutated once at initialization.
+        // Set up the LED. On the Nucleo-446RE it's connected to pin PA5.
+        let gpioa = dp.GPIOA.split();
+        let gpiob = dp.GPIOB.split();
         unsafe {
-            ERROR_LED = Some(Mutex::new(RefCell::new(led)));
+            ERROR_LED = Some(Mutex::new(RefCell::new(
+                dp.GPIOC.split().pc13.into_push_pull_output(),
+            )));
         }
 
-        // Set up the system clock.
         let rcc = dp.RCC.constrain();
         let clocks = rcc
             .cfgr
-            .use_hse(12.MHz())
-            .sysclk(168.MHz())
+            .use_hse(16.MHz())
+            .sysclk(96.MHz())
             .require_pll48clk()
+            .pclk1(42.MHz())
+            .pclk2(84.MHz())
             .freeze();
 
-        let gpioa = dp.GPIOA.split();
+        assert!(clocks.is_pll48clk_valid());
 
-        setup_usb(
-            dp.OTG_FS_GLOBAL,
-            dp.OTG_FS_DEVICE,
-            dp.OTG_FS_PWRCLK,
-            gpioa.pa11,
-            gpioa.pa12,
-            &clocks,
-        );
+        let timer = dp.TIM2.counter_ms(&clocks);
+        let i2c = I2c::new(dp.I2C2, (gpiob.pb10, gpiob.pb9), 100.kHz(), &clocks);
+        let f1 = report_sensor_data(i2c, timer);
+        let timer = dp.TIM3.counter_ms(&clocks);
+        let f2 = blink_led(gpioa.pa4.into_push_pull_output(), timer);
 
-        let mut timer = dp.TIM2.counter_hz(&clocks);
-
-        timer.start(3.MHz()).unwrap();
-
-        let neo_pin = gpioc.pc0.into_push_pull_output().set_speed(Speed::High);
-        let neopixel = Ws2812::new(timer, neo_pin);
-
-        let f = run_usb(neopixel);
-        let mut timer2 = dp.TIM3.counter_hz(&clocks);
-        let f2 = blink_led(&mut timer2);
-
-        ::futures::future::join(f, f2).await;
+        ::futures::join!(f2, f1);
     }
 }
 
-async fn run_usb(
-    mut neopixel: Ws2812<hal::timer::CounterHz<pac::TIM2>, gpio::Pin<Output<PushPull>, 'C', 0>>,
-) -> ! {
+async fn blink_led<const P: char, const T: u8>(
+    mut led: Pin<P, T, Output<PushPull>>,
+    mut timer: CounterMs<pac::TIM3>,
+) {
+    timer.start(500.millis()).unwrap();
     loop {
-        let mut buf = [0u8; 64];
-        match get_serial().read(&mut buf).await {
-            Ok(count) if count > 0 => {
-                // Skips newlines.
-                // FIXME: This is a bit of a hack.
-                if count == 2 && buf[0] == b'\r' && buf[1] == b'\n' {
-                    continue;
-                }
-
-                if buf[0..count].starts_with(b"panic!") {
-                    panic!("at the disco");
-                }
-
-                let mut buf2 = [0u8; 128];
-                let rgb = parse_rgb_hex(&buf[0..count]).await;
-                if let Ok(rgb) = rgb {
-                    neopixel.write([rgb].iter().cloned()).unwrap();
-                } else {
-                    get_serial()
-                        .log(
-                            show(
-                                &mut buf2,
-                                format_args!("invalid rgb {:?}\n", &buf[0..count]),
-                            )
-                            .unwrap(),
-                        )
-                        .await;
-                }
-            }
-            _ => {}
-        }
+        led.set_high();
+        NbFuture::new(|| timer.wait()).await.unwrap();
+        led.set_low();
+        NbFuture::new(|| timer.wait()).await.unwrap();
     }
 }
 
-/// Parses a hex #rrggbb string into an RGB8 color.
-async fn parse_rgb_hex(hex: &[u8]) -> Result<RGB8, ()> {
-    let mut rgb = RGB8 { r: 0, g: 0, b: 0 };
-    if hex.len() != 6 {
-        return Err(());
+async fn report_sensor_data(
+    i2c: I2c<pac::I2C2, (gpio::Pin<'B', 10>, gpio::Pin<'B', 9>)>,
+    mut timer: CounterMs<pac::TIM2>,
+) {
+    let mut bmp388 = BMP388::new(i2c).unwrap();
+    bmp388
+        .set_power_control(bmp388::PowerControl {
+            pressure_enable: true,
+            temperature_enable: true,
+            mode: bmp388::PowerMode::Normal,
+        })
+        .unwrap();
+    timer.start(5000.millis()).unwrap();
+    loop {
+        bmp388
+            .sensor_values()
+            .map(|values| {
+                let alt = (1.0 / 0.0065)
+                    * (pow((values.pressure) / 101325.0, 1.0 / 5.257) - 1.0)
+                    * values.temperature;
+
+                hprintln!(
+                    "Temperature: {:.2}°C, Pressure: {:.2}Pa, Altitude: {:.2}m",
+                    values.temperature,
+                    values.pressure,
+                    alt
+                );
+            })
+            .unwrap();
+        NbFuture::new(|| timer.wait()).await.unwrap();
     }
-
-    let hex = core::str::from_utf8(&hex[0..6]).map_err(|_| ())?;
-
-    rgb.r = u8::from_str_radix(&hex[0..2], 16).map_err(|_| ())?;
-    rgb.g = u8::from_str_radix(&hex[2..4], 16).map_err(|_| ())?;
-    rgb.b = u8::from_str_radix(&hex[4..6], 16).map_err(|_| ())?;
-
-    get_serial()
-        .log(
-            show(
-                &mut [0u8; 64],
-                format_args!("{} {} {}\n", rgb.r, rgb.g, rgb.b),
-            )
-            .unwrap(),
-        )
-        .await;
-    Ok(rgb)
 }
 
 #[panic_handler]
 pub fn panic(info: &PanicInfo) -> ! {
-    if let Some(serial) = logger::try_get_serial() {
-        {
-            let f = serial.log("A panic! occured! The system has been halted!\n");
-            pin_mut!(f);
-            let mut cm = Cassette::new(f);
-            while cm.poll_on().is_none() {}
-        }
-
-        let mut buffer = [0u8; 1024];
-
-        {
-            let f = serial.log(
-                show(&mut buffer, format_args!("{}\n", info))
-                    .unwrap_or("Formatting error occured!\n"),
-            );
-            pin_mut!(f);
-            let mut cm = Cassette::new(f);
-            while cm.poll_on().is_none() {}
+    unsafe {
+        if let Some(led) = ERROR_LED.as_mut() {
+            cortex_m::interrupt::free(|cs| {
+                let mut led = led.borrow(cs).borrow_mut();
+                led.set_high();
+            });
+            hprintln!("Panic! {}", info);
         }
     }
-
-    // SAFETY: error_led is only mutated once at initialization.
-    cortex_m::interrupt::free(|cs| unsafe {
-        ERROR_LED
-            .as_ref()
-            .unwrap()
-            .borrow(cs)
-            .borrow_mut()
-            .set_low();
-    });
-
     loop {}
 }
