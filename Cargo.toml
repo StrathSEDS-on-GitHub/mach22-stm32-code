@@ -19,4 +19,4 @@ libm = "0.2.2"
 
 [dependencies.stm32f4xx-hal]
 version = "0.13.2"
-features = ["rt", "stm32f411"] # replace the model of your microcontroller here
+features = ["rt", "stm32f411", "sdio", "sdio-host"] # replace the model of your microcontroller here

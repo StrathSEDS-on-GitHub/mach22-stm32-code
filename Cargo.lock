@@ -324,6 +324,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "sdio-host"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "355c411b00ad0634aa29824b37d0755e931a349b3230ffdef846c140eeed9c09"
+
+[[package]]
 name = "semver"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -374,6 +380,7 @@ dependencies = [
  "fugit-timer",
  "nb 1.0.0",
  "rand_core",
+ "sdio-host",
  "stm32f4",
  "time",
  "void",

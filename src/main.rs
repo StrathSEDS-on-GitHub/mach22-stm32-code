@@ -7,16 +7,17 @@
 
 use crate::futures::NbFuture;
 use crate::hal::timer::TimerExt;
-use bmp388::SamplingRate;
 use bmp388::BMP388;
 use cassette::pin_mut;
 use cassette::Cassette;
-use cortex_m::interrupt::CriticalSection;
 use cortex_m::interrupt::Mutex;
+use cortex_m_semihosting::hprint;
 use cortex_m_semihosting::hprintln;
 use hal::gpio::Pin;
 use hal::i2c::I2c;
-use hal::timer::CounterHz;
+use hal::sdio::ClockFreq;
+use hal::sdio::SdCard;
+use hal::sdio::Sdio;
 use hal::timer::CounterMs;
 use libm::pow;
 
@@ -25,7 +26,6 @@ use core::panic::PanicInfo;
 use hal::gpio;
 use hal::gpio::Output;
 use hal::gpio::PushPull;
-use hal::gpio::Speed;
 
 use crate::hal::{pac, prelude::*};
 use cortex_m_rt::entry;
@@ -74,6 +74,45 @@ async fn main() {
 
         assert!(clocks.is_pll48clk_valid());
 
+        let mut delay = cp.SYST.delay(&clocks);
+
+        let d0 = gpiob.pb4.into_alternate().internal_pull_up(true);
+        let d1 = gpioa.pa8.into_alternate().internal_pull_up(true);
+        let d2 = gpioa.pa9.into_alternate().internal_pull_up(true);
+        let d3 = gpiob.pb5.into_alternate().internal_pull_up(true);
+        let clk = gpiob.pb15.into_alternate().internal_pull_up(false);
+        let cmd = gpioa.pa6.into_alternate().internal_pull_up(true);
+        let mut sdio: Sdio<SdCard> = Sdio::new(dp.SDIO, (clk, cmd, d0, d1, d2, d3), &clocks);
+
+        hprintln!("Waiting for card...");
+
+        // Wait for card to be ready
+        loop {
+            match sdio.init(ClockFreq::F24Mhz) {
+                Ok(_) => break,
+                Err(_err) => (),
+            }
+
+            delay.delay_ms(1000u32);
+        }
+
+        let nblocks = sdio.card().map(|c| c.block_count()).unwrap_or(0);
+        hprintln!("Card detected: nbr of blocks: {:?}", nblocks);
+
+        // Read a block from the card and print the data
+        let mut block = [0u8; 512];
+
+        match sdio.read_block(0, &mut block) {
+            Ok(()) => (),
+            Err(err) => {
+                hprintln!("Failed to read block: {:?}", err);
+            }
+        }
+
+        for b in block.iter() {
+            hprint!("{:X} ", b);
+        }
+        
         let timer = dp.TIM2.counter_ms(&clocks);
         let i2c = I2c::new(dp.I2C2, (gpiob.pb10, gpiob.pb9), 100.kHz(), &clocks);
         let f1 = report_sensor_data(i2c, timer);
