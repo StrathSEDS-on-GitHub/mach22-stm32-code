@@ -1,28 +1,43 @@
-#![feature(async_closure)]
-//! Demonstrate the use of a blocking `Delay` using the SYST (sysclock) timer.
-
 #![allow(clippy::empty_loop)]
 #![no_main]
 #![no_std]
 
+use crate::bmi055::BMI055;
 use crate::futures::NbFuture;
 use crate::hal::timer::TimerExt;
 use bmp388::BMP388;
 use cassette::pin_mut;
 use cassette::Cassette;
 use cortex_m::interrupt::Mutex;
+use cortex_m::iprintln;
+use cortex_m::itm;
+use cortex_m::peripheral::itm::Stim;
 use cortex_m_semihosting::hprintln;
+use embedded_hal::PwmPin;
+use embedded_hal::digital::v2::OutputPin;
+use crate::futures::YieldFuture;
 use hal::gpio::Edge;
 use hal::gpio::Input;
 use hal::gpio::Pin;
 use hal::i2c::I2c;
 use hal::interrupt;
+use hal::pac::DBGMCU;
+use hal::pac::TIM2;
+use hal::pac::TIM5;
 use hal::timer;
+use hal::timer::CounterHz;
 use hal::timer::CounterMs;
+use hal::timer::PwmChannel;
 use libm::pow;
+use libm::sin;
 
 use core::cell::RefCell;
+use core::cmp::max;
+use core::cmp::min;
+use core::f32::consts::FRAC_PI_2;
+use core::fmt::Debug;
 use core::panic::PanicInfo;
+use core::ptr;
 use hal::gpio;
 use hal::gpio::Output;
 use hal::gpio::PushPull;
@@ -31,13 +46,85 @@ use crate::hal::{pac, prelude::*};
 use cortex_m_rt::entry;
 use stm32f4xx_hal as hal;
 mod futures;
+mod bmi055;
+mod usb_serial;
+
+const TEMPO: i32 = 114;
+const MELODY: &[i32] = &[
+  587,-4, 659,-4, 440,4,
+  659,-4, 740,-4, 880,16, 784,16, 740,8,
+  587,-4, 659,-4, 440,2,
+  440,16, 440,16, 494,16, 587,8, 587,16,
+  587,-4, 659,-4, 440,4,
+  659,-4, 740,-4, 880,16, 784,16, 740,8,
+  587,-4, 659,-4, 440,2,
+  440,16, 440,16, 494,16, 587,8, 587,16,
+  0,4, 494,8, 554,8, 587,8, 587,8, 659,8, 554,-8,
+  494,16, 440,2, 0,4,
+
+  0,8, 494,8, 494,8, 554,8, 587,8, 494,4, 440,8,
+  880,8, 0,8, 880,8, 659,-4, 0,4,
+  494,8, 494,8, 554,8, 587,8, 494,8, 587,8, 659,8, 0,8,
+  0,8, 554,8, 494,8, 440,-4, 0,4,
+  0,8, 494,8, 494,8, 554,8, 587,8, 494,8, 440,4,
+  659,8, 659,8, 659,8, 740,8, 659,4, 0,4,
+
+  587,2, 659,8, 740,8, 587,8,
+  659,8, 659,8, 659,8, 740,8, 659,4, 440,4,
+  0,2, 494,8, 554,8, 587,8, 494,8,
+  0,8, 659,8, 740,8, 659,-4, 440,16, 494,16, 587,16, 494,16,
+  740,-8, 740,-8, 659,-4, 440,16, 494,16, 587,16, 494,16,
+
+  659,-8, 659,-8, 587,-8, 554,16, 494,-8, 440,16, 494,16, 587,16, 494,16,
+  587,4, 659,8, 554,-8, 494,16, 440,8, 440,8, 440,8,
+  659,4, 587,2, 440,16, 494,16, 587,16, 494,16,
+  740,-8, 740,-8, 659,-4, 440,16, 494,16, 587,16, 494,16,
+  880,4, 554,8, 587,-8, 554,16, 494,8, 440,16, 494,16, 587,16, 494,16,
+
+  587,4, 659,8, 554,-8, 494,16, 440,4, 440,8,
+  659,4, 587,2, 0,4,
+  0,8, 494,8, 587,8, 494,8, 587,8, 659,4, 0,8,
+  0,8, 554,8, 494,8, 440,-4, 0,4,
+  0,8, 494,8, 494,8, 554,8, 587,8, 494,8, 440,4,
+  0,8, 880,8, 880,8, 659,8, 740,8, 659,8, 587,8,
+
+  0,8, 440,8, 494,8, 554,8, 587,8, 494,8,
+  0,8, 554,8, 494,8, 440,-4, 0,4,
+  494,8, 494,8, 554,8, 587,8, 494,8, 440,4, 0,8,
+  0,8, 659,8, 659,8, 740,4, 659,-4,
+  587,2, 587,8, 659,8, 740,8, 659,4,
+  659,8, 659,8, 740,8, 659,8, 440,8, 440,4,
+
+  0,-4, 440,8, 494,8, 554,8, 587,8, 494,8,
+  0,8, 659,8, 740,8, 659,-4, 440,16, 494,16, 587,16, 494,16,
+  740,-8, 740,-8, 659,-4, 440,16, 494,16, 587,16, 494,16,
+  659,-8, 659,-8, 587,-8, 554,16, 494,8, 440,16, 494,16, 587,16, 494,16,
+  587,4, 659,8, 554,-8, 494,16, 440,4, 440,8,
+
+   659,4, 587,2, 440,16, 494,16, 587,16, 494,16,
+  740,-8, 740,-8, 659,-4, 440,16, 494,16, 587,16, 494,16,
+  880,4, 554,8, 587,-8, 554,16, 494,8, 440,16, 494,16, 587,16, 494,16,
+  587,4, 659,8, 554,-8, 494,16, 440,4, 440,8,
+  659,4, 587,2, 440,16, 494,16, 587,16, 494,16,
+
+  740,-8, 740,-8, 659,-4, 440,16, 494,16, 587,16, 494,16,
+  880,4, 554,8, 587,-8, 554,16, 494,8, 440,16, 494,16, 587,16, 494,16,
+  587,4, 659,8, 554,-8, 494,16, 440,4, 440,8,
+  659,4, 587,2, 440,16, 494,16, 587,16, 494,16,
+  740,-8, 740,-8, 659,-4, 440,16, 494,16, 587,16, 494,16,
+
+  880,4, 554,8, 587,-8, 554,16, 494,8, 440,16, 494,16, 587,16, 494,16,
+  587,4, 659,8, 554,-8, 494,16, 440,4, 440,8,
+
+  659,4, 587,2, 0,4
+];
 
 static mut ERROR_LED: Mutex<RefCell<Option<gpio::Pin<'C', 13, Output<PushPull>>>>> =
     Mutex::new(RefCell::new(None));
-static mut BUZZER: Mutex<RefCell<Option<gpio::Pin<'A', 1, Output<PushPull>>>>> =
-    Mutex::new(RefCell::new(None));
 static mut USER_BUTTON: Mutex<RefCell<Option<gpio::Pin<'A', 0, Input>>>> =
     Mutex::new(RefCell::new(None));
+
+static mut SHOULD_RICKROLL: Mutex<RefCell<bool>> = Mutex::new(RefCell::new(false));
 
 #[entry]
 fn entry_point() -> ! {
@@ -53,18 +140,17 @@ fn entry_point() -> ! {
 }
 
 async fn main() {
-    if let (Some(mut dp), Some(cp)) = (
+    if let (Some(mut dp), Some(mut cp)) = (
         pac::Peripherals::take(),
         cortex_m::peripheral::Peripherals::take(),
     ) {
-        // Set up the LED. On the Nucleo-446RE it's connected to pin PA5.
         let gpioa = dp.GPIOA.split();
         let gpiob = dp.GPIOB.split();
 
-            cortex_m::interrupt::free(|cs| {
-                // SAFETY: Mutex makes access of static mutable variable safe
-                unsafe { ERROR_LED.borrow(cs) }.replace(Some(dp.GPIOC.split().pc13.into_push_pull_output()));
-            });
+        cortex_m::interrupt::free(|cs| {
+            // SAFETY: Mutex makes access of static mutable variable safe
+            unsafe { ERROR_LED.borrow(cs) }.replace(Some(dp.GPIOC.split().pc13.into_push_pull_output()));
+        });
 
         let rcc = dp.RCC.constrain();
         let clocks = rcc
@@ -130,24 +216,86 @@ async fn main() {
             pac::NVIC::unmask(btn_int_num);
         };
 
+        cortex_m::interrupt::free(|cs| {
+            // SAFETY: Mutex makes access of static mutable variable safe
+            unsafe { USER_BUTTON.borrow(cs) }.replace(Some(button));
+        });
         
-            cortex_m::interrupt::free(|cs| {
-                // SAFETY: Mutex makes access of static mutable variable safe
-                unsafe { USER_BUTTON.borrow(cs) }.replace(Some(button));
-                unsafe { BUZZER.borrow(cs) }
-                    .replace(Some(gpioa.pa1.into_push_pull_output()));
-            });
+        let counter = dp.TIM5.counter_hz(&clocks);
+        let pin = gpioa.pa1.into_alternate();
+        let led = gpioa.pa5.into_push_pull_output();
+        let pwm = dp.TIM2.pwm_hz(pin, 100.kHz(), &clocks).split();
         
 
-        let timer = dp.TIM2.counter_ms(&clocks);
-        let i2c = I2c::new(dp.I2C2, (gpiob.pb10, gpiob.pb9), 100.kHz(), &clocks);
-        let f1 = report_sensor_data(i2c, timer);
+        let timer = dp.TIM4.counter_ms(&clocks);
+        let i2c1 = I2c::new(dp.I2C1, (gpiob.pb6, gpiob.pb7), 100.kHz(), &clocks);
+        let i2c2 = I2c::new(dp.I2C2, (gpiob.pb10, gpiob.pb9), 100.kHz(), &clocks);
+        let f1 = report_sensor_data(i2c1, i2c2, timer);
         let timer = dp.TIM3.counter_ms(&clocks);
         let f2 = blink_led(gpioa.pa4.into_push_pull_output(), timer);
+        let f3 = rickroll_everyone(pwm, counter, led);
 
-        ::futures::join!(f2, f1);
+        ::futures::join!(f1, f2, f3);
     }
 }
+
+async fn rickroll_everyone<const C: u8, LedPin: OutputPin, E: Debug>(mut pwm: timer::PwmChannel<pac::TIM2, C>, mut counter: timer::CounterHz<pac::TIM5>, mut led: LedPin) 
+where LedPin: OutputPin<Error = E> {
+    let chunks = MELODY.chunks(2);
+    let note_length_ms: i32 = 60000 * 4 / TEMPO;
+    pwm.enable();
+    for note_and_duration in chunks {
+        loop {
+            let should_rickroll = cortex_m::interrupt::free(|cs| { 
+                // SAFETY: Mutex makes access of static mutable variable safe
+                unsafe { *SHOULD_RICKROLL.borrow(cs).borrow() }
+            });
+            if should_rickroll {
+                break;
+            } else {
+                YieldFuture::new().await;
+            }
+        }
+
+        let (note, divider) = (note_and_duration[0], note_and_duration[1]);
+        // calculates the duration of each note
+        let note_duration = if divider > 0 {
+          // regular note, just proceed
+            (note_length_ms) / divider
+        } else {
+          // dotted notes are represented with negative durations!!
+          (note_length_ms)  * 3 / (-divider) / 2
+        };
+
+
+        if note == 0 {
+            counter.start(max((1_000/note_duration) as u32, 1).kHz()).unwrap();
+            NbFuture::new(|| counter.wait()).await.unwrap();
+            continue;
+        }
+
+        counter.start(((note * 2) as u32).Hz()).unwrap();
+        let mut pulse = false;
+        let mut n = 0;
+        loop {
+            if pulse {
+                pwm.set_duty(pwm.get_max_duty());
+                led.set_high().unwrap();
+            } else {
+                pwm.set_duty(0);
+                led.set_low().unwrap();
+            }
+            NbFuture::new(|| counter.wait()).await.unwrap();
+            pulse = if 1000 * n / (note * 2) >= note_duration * 8 / 10 { false } else { !pulse };
+            n += 1;
+
+            if 1000 * n / (note * 2) >= note_duration {
+                break;
+            }
+        }
+    }
+}
+
 #[interrupt]
 fn EXTI0() {
     cortex_m::interrupt::free(|cs| 
@@ -156,13 +304,8 @@ fn EXTI0() {
             let mut btn_ref = unsafe { USER_BUTTON.borrow(cs) }.borrow_mut();
             let btn = btn_ref.as_mut().unwrap();
             btn.clear_interrupt_pending_bit();
-            let mut buzzer_ref = unsafe { BUZZER.borrow(cs) }.borrow_mut();
-            let buzzer = buzzer_ref.as_mut().unwrap();
-            if btn.is_low() {
-                buzzer.set_high();
-            } else {
-                buzzer.set_low();
-            }
+            let mut should_rickroll = unsafe { SHOULD_RICKROLL.borrow(cs) }.borrow_mut();
+            *should_rickroll = btn.is_low();
     });
 }
 
@@ -181,13 +324,14 @@ async fn blink_led<const P: char, const T: u8, TIM>(
     }
 }
 
-async fn report_sensor_data<TIM>(
-    i2c: I2c<pac::I2C2, (gpio::Pin<'B', 10>, gpio::Pin<'B', 9>)>,
+async fn report_sensor_data<TIM, PINS>(
+    i2c1: I2c<pac::I2C1, PINS>,
+    i2c2: I2c<pac::I2C2, (gpio::Pin<'B', 10>, gpio::Pin<'B', 9>)>,
     mut timer: CounterMs<TIM>,
 ) where
     TIM: timer::Instance,
 {
-    let mut bmp388 = BMP388::new(i2c).unwrap();
+    let mut bmp388 = BMP388::new(i2c2).unwrap();
     bmp388
         .set_power_control(bmp388::PowerControl {
             pressure_enable: true,
@@ -195,6 +339,11 @@ async fn report_sensor_data<TIM>(
             mode: bmp388::PowerMode::Normal,
         })
         .unwrap();
+
+
+    //let mut bmi055 = BMI055::new(i2c1).unwrap();
+    //hprintln!("BMI055: {:?}", bmi055.id().unwrap());
+
     timer.start(5000.millis()).unwrap();
     loop {
         bmp388
@@ -204,12 +353,12 @@ async fn report_sensor_data<TIM>(
                     * (pow((values.pressure) / 101325.0, 1.0 / 5.257) - 1.0)
                     * values.temperature;
 
-                hprintln!(
+                /*hprintln!(
                     "Temperature: {:.2}°C, Pressure: {:.2}Pa, Altitude: {:.2}m",
                     values.temperature,
                     values.pressure,
                     alt
-                );
+                );*/
             })
             .unwrap();
         NbFuture::new(|| timer.wait()).await.unwrap();
