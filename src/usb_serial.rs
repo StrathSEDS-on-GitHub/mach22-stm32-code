@@ -1,6 +1,7 @@
 use core::{cell::RefCell};
 
 use cortex_m::interrupt::Mutex;
+use cortex_m_semihosting::hprintln;
 use stm32f4xx_hal::{
     gpio::{Input, Pin},
     otg_fs::{UsbBus, USB},
@@ -63,7 +64,8 @@ impl<'a> Serial<'a> {
                         match serial_port.write(&buf[write_offset..count]) {
                             Ok(len) => {
                                 if len > 0 {
-                                    write_offset += len
+                                    write_offset += len;
+                                    //hprintln!("Wrote {} bytes", len);
                                 };
                             }
                             Err(e) => return Err(e),
@@ -90,6 +92,13 @@ impl<'a> Serial<'a> {
             || self.poll(),
         )
         .await
+    }
+
+    pub fn read_no_block(&self, buffer: &mut [u8]) -> Result<usize, UsbError> {
+        cortex_m::interrupt::free(|cs| {
+            let mut serial_port = self.serial_port.borrow(cs).borrow_mut();
+            serial_port.read(buffer)
+        })
     }
 
     pub fn poll(&self) -> bool {
