@@ -324,52 +324,14 @@ fn EXTI0() {
 }
 
 async fn radio_serial<TIM, PINS, const P: char, const T: u8>(
-    mut serial: Serial<USART2, PINS, u8>,
+    serial: Serial<USART2, PINS, u8>,
     mut led: Pin<P, T, Output<PushPull>>,
     mut timer: CounterMs<TIM>,
 ) where
     TIM: timer::Instance,
 {
-    timer.start(10.millis()).unwrap();
-    let mut buffer = [0u8; 32];
-    let mut written = 0;
-    let mut bytes = 0;
+    timer.start(8.millis()).unwrap();
     let (mut tx, mut rx) = serial.split();
-
-    let mut x = 0;
-
-    while x < 500 {
-        get_serial().write(b"buf");
-        get_serial().poll();
-        nb::block!(timer.wait()).unwrap();
-        x += 1;
-    }
-    hprintln!("Setup");
-
-    for c in [0x7eu8,0x0,0x4,0x8,0x1,0x41,0x50,0x65,0x2b,0x2b,0x2b,0x41,0x54,0x41,0x50,0xd] {
-        NbFuture::new(||tx.write(c)).await.unwrap();
-
-        match rx.read() {
-            Ok(byte) => {
-                led.set_high();
-                //hprintln!("read?");
-                //hprint!("{}", byte as char);
-                //hprintln!("Received: {}", byte);
-                get_serial().write(&[byte]).await;
-                led.set_low();
-            }
-            Err(nb::Error::WouldBlock) => {
-                //hprintln!("Would block {}", rx.is_idle());
-            }
-            Err(e) => {
-                //hprintln!("{:?}", e);
-            }
-        }
-        get_serial().poll();
-        let mut buffer = [0u8; 32];
-        get_serial().read_no_block(&mut buffer);
-    }
-
 
     loop {
         match rx.read() {
@@ -388,10 +350,18 @@ async fn radio_serial<TIM, PINS, const P: char, const T: u8>(
                 //hprintln!("{:?}", e);
             }
         }
+
+        let mut buf = [0u8; 1];
+        match get_serial().read_no_block(&mut buf) {
+            Ok(b) => {
+                nb::block!(tx.write(buf[0])).unwrap();
+            },
+            Err(UsbError::WouldBlock) => {}
+            Err(e) => {}
+        }
+
         get_serial().poll();
-        let mut buffer = [0u8; 32];
-        get_serial().read_no_block(&mut buffer);
-        //hprintln!("h");
+        NbFuture::new(||timer.wait()).await.unwrap();
     }
 }
 
@@ -445,6 +415,6 @@ pub fn panic(info: &PanicInfo) -> ! {
                 led.set_high();
             }
         });
-        hprintln!("Panic! {}", info);
+        // hprintln!("Panic! {}", info);
     loop {}
 }
