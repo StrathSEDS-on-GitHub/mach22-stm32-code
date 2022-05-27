@@ -17,7 +17,7 @@ use cortex_m_semihosting::hprint;
 use cortex_m_semihosting::hprintln;
 use embedded_hal::PwmPin;
 use embedded_hal::digital::v2::OutputPin;
-use hal::pac::USART2;
+use hal::pac::USART1;
 use hal::serial::Rx;
 use hal::serial::Serial;
 use hal::serial::Tx;
@@ -244,7 +244,7 @@ async fn main() {
         let f1 = report_sensor_data(i2c1, i2c2, timer);
         let timer = dp.TIM3.counter_ms(&clocks);
 
-        let serial = dp.USART2.serial((gpioa.pa2.into_alternate(), gpioa.pa3.into_alternate()), 9600.bps(), &clocks).unwrap();
+        let serial = dp.USART1.serial((gpioa.pa15.into_alternate(), gpioa.pa10.into_alternate()), 9600.bps(), &clocks).unwrap();
 
         let f2 = radio_serial(serial, led, timer);
         //let f3 = rickroll_everyone(pwm, counter, led);
@@ -324,7 +324,7 @@ fn EXTI0() {
 }
 
 async fn radio_serial<TIM, PINS, const P: char, const T: u8>(
-    mut serial: Serial<USART2, PINS, u8>,
+    mut serial: Serial<USART1, PINS, u8>,
     mut led: Pin<P, T, Output<PushPull>>,
     mut timer: CounterMs<TIM>,
 ) where
