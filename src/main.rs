@@ -17,6 +17,7 @@ use cortex_m_semihosting::hprint;
 use cortex_m_semihosting::hprintln;
 use embedded_hal::PwmPin;
 use embedded_hal::digital::v2::OutputPin;
+use hal::pac::USART1;
 use hal::pac::USART2;
 use hal::serial::Rx;
 use hal::serial::Serial;
@@ -244,9 +245,10 @@ async fn main() {
         let f1 = report_sensor_data(i2c1, i2c2, timer);
         let timer = dp.TIM3.counter_ms(&clocks);
 
-        let serial = dp.USART2.serial((gpioa.pa2.into_alternate(), gpioa.pa3.into_alternate()), 9600.bps(), &clocks).unwrap();
+        let radio = dp.USART2.serial((gpioa.pa2.into_alternate(), gpioa.pa3.into_alternate()), 9600.bps(), &clocks).unwrap();
+        let gps = dp.USART1.serial((gpioa.pa15.into_alternate(), gpioa.pa10.into_alternate()), 9600.bps(), &clocks).unwrap();
 
-        let f2 = radio_serial(serial, led, timer);
+        let f2 = radio_serial(radio, gps, led, timer);
         //let f3 = rickroll_everyone(pwm, counter, led);
 
         f2.await;
@@ -323,45 +325,28 @@ fn EXTI0() {
     });
 }
 
-async fn radio_serial<TIM, PINS, const P: char, const T: u8>(
-    serial: Serial<USART2, PINS, u8>,
+async fn radio_serial<TIM, PinsRadio, PinsGPS, const P: char, const T: u8>(
+    mut radio: Serial<USART2, PinsRadio, u8>,
+    mut gps: Serial<USART1, PinsGPS, u8>,
     mut led: Pin<P, T, Output<PushPull>>,
     mut timer: CounterMs<TIM>,
 ) where
     TIM: timer::Instance,
 {
     timer.start(8.millis()).unwrap();
-    let (mut tx, mut rx) = serial.split();
 
     loop {
-        match rx.read() {
-            Ok(byte) => {
+        match gps.read() {
+            Ok(b) => {
                 led.set_high();
-                //hprintln!("read?");
-                //hprint!("{}", byte as char);
-                //hprintln!("Received: {}", byte);
-                get_serial().write(&[byte]).await;
+                nb::block!(radio.write(b)).unwrap();
                 led.set_low();
             }
-            Err(nb::Error::WouldBlock) => {
-                //hprintln!("Would block {}", rx.is_idle());
-            }
-            Err(e) => {
-                //hprintln!("{:?}", e);
+            Err(nb::Error::WouldBlock) => {}
+            Err(nb::Error::Other(e)) => {
+                panic!("Error: {:?}", e);
             }
         }
-
-        let mut buf = [0u8; 1];
-        match get_serial().read_no_block(&mut buf) {
-            Ok(b) => {
-                nb::block!(tx.write(buf[0])).unwrap();
-            },
-            Err(UsbError::WouldBlock) => {}
-            Err(e) => {}
-        }
-
-        get_serial().poll();
-        NbFuture::new(||timer.wait()).await.unwrap();
     }
 }
 
