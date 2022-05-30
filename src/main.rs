@@ -351,16 +351,33 @@ async fn radio_serial<TIM, PinsRadio, PinsGPS, const P: char, const T: u8>(
         nb::block!(radio.write(*b)).unwrap();
     }
 
+    let bytes_read = 0;
     loop {
-        if let Ok(byte) = gps.read() {
-            let data = [0x7Eu8, 0x00, 0x0F, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFE, 0x00, 0x00, byte, 0x00];
-            let csum = data[3..].iter().fold(0, |acc, &x| (acc + x) % 256 as u8) as u8;
-            data.last().replace(&csum);
+        if let Ok(byte) = radio.read() {
+            bytes_read += 1;
+            get_serial().write(&[byte]).await;
+        }
+        if bytes_read % 17 == 0 {
+            let data = [0x7Eu8, 0x00, 0xFF, 0x08, 0x01, 'D' as u8, 'B' as u8, 0x00];
+            let checksum = data[3..].iter().fold(0, |acc, &x| (acc as u8).wrapping_add(x));
+            data.last().replace(&checksum);
 
-            for b in data {
-                nb::block!(radio.write(b)).unwrap();
+            for byte in data { 
+                nb::block!(radio.write(byte)).unwrap();
+            }
+
+            let mut resp_bytes = 0;
+            loop {
+                if let Ok(byte) = radio.read() {
+                    get_serial().write(&[byte]).await;
+                    resp_bytes += 1;
+                    if resp_bytes == 10 {
+                        break;
+                    }
+                }
             }
         }
+        get_serial().poll();
     }
 
 
