@@ -35,7 +35,7 @@ use hal::pac::TIM2;
 use hal::pac::TIM5;
 use hal::timer;
 use hal::timer::CounterHz;
-use hal::timer::CounterMs;
+use hal::timer::DelayMs;
 use hal::timer::PwmChannel;
 use libm::pow;
 use libm::sin;
@@ -242,8 +242,8 @@ async fn main() {
         let timer = dp.TIM4.counter_ms(&clocks);
         let i2c1 = I2c::new(dp.I2C1, (gpiob.pb6, gpiob.pb7), 100.kHz(), &clocks);
         let i2c2 = I2c::new(dp.I2C2, (gpiob.pb10, gpiob.pb9), 100.kHz(), &clocks);
-        let f1 = report_sensor_data(i2c1, i2c2, timer);
-        let timer = dp.TIM3.counter_ms(&clocks);
+        //let f1 = report_sensor_data(i2c1, i2c2, timer);
+        let timer = dp.TIM3.delay_ms(&clocks);
 
         let radio = dp.USART2.serial((gpioa.pa2.into_alternate(), gpioa.pa3.into_alternate()), 9600.bps(), &clocks).unwrap();
         let gps = dp.USART1.serial((gpioa.pa15.into_alternate(), gpioa.pa10.into_alternate()), 9600.bps(), &clocks).unwrap();
@@ -329,25 +329,60 @@ async fn radio_serial<TIM, PinsRadio, PinsGPS, const P: char, const T: u8>(
     mut radio: Serial<USART2, PinsRadio, u8>,
     mut gps: Serial<USART1, PinsGPS, u8>,
     mut led: Pin<P, T, Output<PushPull>>,
-    mut timer: CounterMs<TIM>,
+    mut timer: DelayMs<TIM>,
 ) where
     TIM: timer::Instance,
 {
-    timer.start(8.millis()).unwrap();
+
+    nb::block!(radio.write('+' as u8)).unwrap();
+    nb::block!(radio.write('+' as u8)).unwrap();
+    nb::block!(radio.write('+' as u8)).unwrap();
+
+    check_radio_ok(&mut radio);
+
+    let command = b"ATAP \x02\r";
+    for b in command {
+        nb::block!(radio.write(*b)).unwrap();
+    }
+    check_radio_ok(&mut radio);
+
+    let command = b"CN\r";
+    for b in command {
+        nb::block!(radio.write(*b)).unwrap();
+    }
 
     loop {
-        match gps.read() {
-            Ok(b) => {
-                led.set_high();
+        if let Ok(byte) = gps.read() {
+            let data = [0x7Eu8, 0x00, 0x0F, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFE, 0x00, 0x00, byte, 0x00];
+            let csum = data[3..].iter().fold(0, |acc, &x| (acc + x) % 256 as u8) as u8;
+            data.last().replace(&csum);
+
+            for b in data {
                 nb::block!(radio.write(b)).unwrap();
-                led.set_low();
-            }
-            Err(nb::Error::WouldBlock) => {}
-            Err(nb::Error::Other(e)) => {
-                panic!("Error: {:?}", e);
             }
         }
     }
+
+
+}
+
+fn check_radio_ok<PinsRadio>(radio: &mut Serial<USART2, PinsRadio>) {
+    let mut data = [0u8;3];
+    let mut bytes = 0;
+    loop {
+        match radio.read() {
+            Ok(b) => {
+                data[bytes] = b;
+                bytes += 1;
+                if bytes == 3 { break }
+            }
+            Err(nb::Error::WouldBlock) =>{}
+            Err(nb::Error::Other(e)) => {
+                panic!("{:?}", e);
+            }
+        }
+    }
+    if &data != b"OK\r" { panic!("Reply not OK."); }
 }
 
 async fn report_sensor_data<TIM, PINS>(
