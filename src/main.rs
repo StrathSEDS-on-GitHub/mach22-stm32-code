@@ -2,51 +2,44 @@
 #![no_main]
 #![no_std]
 
-use crate::bmi055::BMI055;
 use crate::futures::NbFuture;
+use crate::futures::YieldFuture;
 use crate::hal::timer::TimerExt;
 use crate::usb_serial::setup_usb;
 use bmp388::BMP388;
 use cassette::pin_mut;
 use cassette::Cassette;
+use cortex_m::asm::delay;
 use cortex_m::interrupt::Mutex;
-use cortex_m::iprintln;
-use cortex_m::itm;
-use cortex_m::peripheral::itm::Stim;
-use cortex_m_semihosting::hprint;
 use cortex_m_semihosting::hprintln;
-use embedded_hal::PwmPin;
 use embedded_hal::digital::v2::OutputPin;
-use hal::pac::USART2;
-use hal::serial::Rx;
-use hal::serial::Serial;
-use hal::serial::Tx;
-use usb_device::UsbError;
-use usb_serial::get_serial;
-use crate::futures::YieldFuture;
+use hal::dma;
+use hal::dma::traits::Stream;
+use hal::dma::traits::StreamISR;
+use hal::dma::Stream5;
+use hal::dma::Stream6;
+use hal::dma::Stream7;
+use hal::dma::StreamsTuple;
+use hal::dma::Transfer;
 use hal::gpio::Edge;
 use hal::gpio::Input;
-use hal::gpio::Pin;
 use hal::i2c::I2c;
 use hal::interrupt;
-use hal::pac::DBGMCU;
-use hal::pac::TIM2;
-use hal::pac::TIM5;
+use hal::serial::config::DmaConfig;
+use hal::serial::Rx;
+use hal::serial::Tx;
 use hal::timer;
-use hal::timer::CounterHz;
 use hal::timer::CounterMs;
-use hal::timer::PwmChannel;
 use libm::pow;
-use libm::sin;
 
 use core::cell::RefCell;
 use core::cmp::max;
-use core::cmp::min;
-use core::f32::consts::FRAC_PI_2;
 use core::fmt::Debug;
-use core::fmt::Write;
 use core::panic::PanicInfo;
-use core::ptr;
+use core::slice;
+use core::sync::atomic::AtomicBool;
+use core::sync::atomic::AtomicU32;
+use core::sync::atomic::Ordering;
 use hal::gpio;
 use hal::gpio::Output;
 use hal::gpio::PushPull;
@@ -54,78 +47,43 @@ use hal::gpio::PushPull;
 use crate::hal::{pac, prelude::*};
 use cortex_m_rt::entry;
 use stm32f4xx_hal as hal;
-mod futures;
 mod bmi055;
+mod futures;
+mod radio;
 mod usb_serial;
 
 const TEMPO: i32 = 114;
 const MELODY: &[i32] = &[
-  587,-4, 659,-4, 440,4,
-  659,-4, 740,-4, 880,16, 784,16, 740,8,
-  587,-4, 659,-4, 440,2,
-  440,16, 440,16, 494,16, 587,8, 587,16,
-  587,-4, 659,-4, 440,4,
-  659,-4, 740,-4, 880,16, 784,16, 740,8,
-  587,-4, 659,-4, 440,2,
-  440,16, 440,16, 494,16, 587,8, 587,16,
-  0,4, 494,8, 554,8, 587,8, 587,8, 659,8, 554,-8,
-  494,16, 440,2, 0,4,
-
-  0,8, 494,8, 494,8, 554,8, 587,8, 494,4, 440,8,
-  880,8, 0,8, 880,8, 659,-4, 0,4,
-  494,8, 494,8, 554,8, 587,8, 494,8, 587,8, 659,8, 0,8,
-  0,8, 554,8, 494,8, 440,-4, 0,4,
-  0,8, 494,8, 494,8, 554,8, 587,8, 494,8, 440,4,
-  659,8, 659,8, 659,8, 740,8, 659,4, 0,4,
-
-  587,2, 659,8, 740,8, 587,8,
-  659,8, 659,8, 659,8, 740,8, 659,4, 440,4,
-  0,2, 494,8, 554,8, 587,8, 494,8,
-  0,8, 659,8, 740,8, 659,-4, 440,16, 494,16, 587,16, 494,16,
-  740,-8, 740,-8, 659,-4, 440,16, 494,16, 587,16, 494,16,
-
-  659,-8, 659,-8, 587,-8, 554,16, 494,-8, 440,16, 494,16, 587,16, 494,16,
-  587,4, 659,8, 554,-8, 494,16, 440,8, 440,8, 440,8,
-  659,4, 587,2, 440,16, 494,16, 587,16, 494,16,
-  740,-8, 740,-8, 659,-4, 440,16, 494,16, 587,16, 494,16,
-  880,4, 554,8, 587,-8, 554,16, 494,8, 440,16, 494,16, 587,16, 494,16,
-
-  587,4, 659,8, 554,-8, 494,16, 440,4, 440,8,
-  659,4, 587,2, 0,4,
-  0,8, 494,8, 587,8, 494,8, 587,8, 659,4, 0,8,
-  0,8, 554,8, 494,8, 440,-4, 0,4,
-  0,8, 494,8, 494,8, 554,8, 587,8, 494,8, 440,4,
-  0,8, 880,8, 880,8, 659,8, 740,8, 659,8, 587,8,
-
-  0,8, 440,8, 494,8, 554,8, 587,8, 494,8,
-  0,8, 554,8, 494,8, 440,-4, 0,4,
-  494,8, 494,8, 554,8, 587,8, 494,8, 440,4, 0,8,
-  0,8, 659,8, 659,8, 740,4, 659,-4,
-  587,2, 587,8, 659,8, 740,8, 659,4,
-  659,8, 659,8, 740,8, 659,8, 440,8, 440,4,
-
-  0,-4, 440,8, 494,8, 554,8, 587,8, 494,8,
-  0,8, 659,8, 740,8, 659,-4, 440,16, 494,16, 587,16, 494,16,
-  740,-8, 740,-8, 659,-4, 440,16, 494,16, 587,16, 494,16,
-  659,-8, 659,-8, 587,-8, 554,16, 494,8, 440,16, 494,16, 587,16, 494,16,
-  587,4, 659,8, 554,-8, 494,16, 440,4, 440,8,
-
-   659,4, 587,2, 440,16, 494,16, 587,16, 494,16,
-  740,-8, 740,-8, 659,-4, 440,16, 494,16, 587,16, 494,16,
-  880,4, 554,8, 587,-8, 554,16, 494,8, 440,16, 494,16, 587,16, 494,16,
-  587,4, 659,8, 554,-8, 494,16, 440,4, 440,8,
-  659,4, 587,2, 440,16, 494,16, 587,16, 494,16,
-
-  740,-8, 740,-8, 659,-4, 440,16, 494,16, 587,16, 494,16,
-  880,4, 554,8, 587,-8, 554,16, 494,8, 440,16, 494,16, 587,16, 494,16,
-  587,4, 659,8, 554,-8, 494,16, 440,4, 440,8,
-  659,4, 587,2, 440,16, 494,16, 587,16, 494,16,
-  740,-8, 740,-8, 659,-4, 440,16, 494,16, 587,16, 494,16,
-
-  880,4, 554,8, 587,-8, 554,16, 494,8, 440,16, 494,16, 587,16, 494,16,
-  587,4, 659,8, 554,-8, 494,16, 440,4, 440,8,
-
-  659,4, 587,2, 0,4
+    587, -4, 659, -4, 440, 4, 659, -4, 740, -4, 880, 16, 784, 16, 740, 8, 587, -4, 659, -4, 440, 2,
+    440, 16, 440, 16, 494, 16, 587, 8, 587, 16, 587, -4, 659, -4, 440, 4, 659, -4, 740, -4, 880,
+    16, 784, 16, 740, 8, 587, -4, 659, -4, 440, 2, 440, 16, 440, 16, 494, 16, 587, 8, 587, 16, 0,
+    4, 494, 8, 554, 8, 587, 8, 587, 8, 659, 8, 554, -8, 494, 16, 440, 2, 0, 4, 0, 8, 494, 8, 494,
+    8, 554, 8, 587, 8, 494, 4, 440, 8, 880, 8, 0, 8, 880, 8, 659, -4, 0, 4, 494, 8, 494, 8, 554, 8,
+    587, 8, 494, 8, 587, 8, 659, 8, 0, 8, 0, 8, 554, 8, 494, 8, 440, -4, 0, 4, 0, 8, 494, 8, 494,
+    8, 554, 8, 587, 8, 494, 8, 440, 4, 659, 8, 659, 8, 659, 8, 740, 8, 659, 4, 0, 4, 587, 2, 659,
+    8, 740, 8, 587, 8, 659, 8, 659, 8, 659, 8, 740, 8, 659, 4, 440, 4, 0, 2, 494, 8, 554, 8, 587,
+    8, 494, 8, 0, 8, 659, 8, 740, 8, 659, -4, 440, 16, 494, 16, 587, 16, 494, 16, 740, -8, 740, -8,
+    659, -4, 440, 16, 494, 16, 587, 16, 494, 16, 659, -8, 659, -8, 587, -8, 554, 16, 494, -8, 440,
+    16, 494, 16, 587, 16, 494, 16, 587, 4, 659, 8, 554, -8, 494, 16, 440, 8, 440, 8, 440, 8, 659,
+    4, 587, 2, 440, 16, 494, 16, 587, 16, 494, 16, 740, -8, 740, -8, 659, -4, 440, 16, 494, 16,
+    587, 16, 494, 16, 880, 4, 554, 8, 587, -8, 554, 16, 494, 8, 440, 16, 494, 16, 587, 16, 494, 16,
+    587, 4, 659, 8, 554, -8, 494, 16, 440, 4, 440, 8, 659, 4, 587, 2, 0, 4, 0, 8, 494, 8, 587, 8,
+    494, 8, 587, 8, 659, 4, 0, 8, 0, 8, 554, 8, 494, 8, 440, -4, 0, 4, 0, 8, 494, 8, 494, 8, 554,
+    8, 587, 8, 494, 8, 440, 4, 0, 8, 880, 8, 880, 8, 659, 8, 740, 8, 659, 8, 587, 8, 0, 8, 440, 8,
+    494, 8, 554, 8, 587, 8, 494, 8, 0, 8, 554, 8, 494, 8, 440, -4, 0, 4, 494, 8, 494, 8, 554, 8,
+    587, 8, 494, 8, 440, 4, 0, 8, 0, 8, 659, 8, 659, 8, 740, 4, 659, -4, 587, 2, 587, 8, 659, 8,
+    740, 8, 659, 4, 659, 8, 659, 8, 740, 8, 659, 8, 440, 8, 440, 4, 0, -4, 440, 8, 494, 8, 554, 8,
+    587, 8, 494, 8, 0, 8, 659, 8, 740, 8, 659, -4, 440, 16, 494, 16, 587, 16, 494, 16, 740, -8,
+    740, -8, 659, -4, 440, 16, 494, 16, 587, 16, 494, 16, 659, -8, 659, -8, 587, -8, 554, 16, 494,
+    8, 440, 16, 494, 16, 587, 16, 494, 16, 587, 4, 659, 8, 554, -8, 494, 16, 440, 4, 440, 8, 659,
+    4, 587, 2, 440, 16, 494, 16, 587, 16, 494, 16, 740, -8, 740, -8, 659, -4, 440, 16, 494, 16,
+    587, 16, 494, 16, 880, 4, 554, 8, 587, -8, 554, 16, 494, 8, 440, 16, 494, 16, 587, 16, 494, 16,
+    587, 4, 659, 8, 554, -8, 494, 16, 440, 4, 440, 8, 659, 4, 587, 2, 440, 16, 494, 16, 587, 16,
+    494, 16, 740, -8, 740, -8, 659, -4, 440, 16, 494, 16, 587, 16, 494, 16, 880, 4, 554, 8, 587,
+    -8, 554, 16, 494, 8, 440, 16, 494, 16, 587, 16, 494, 16, 587, 4, 659, 8, 554, -8, 494, 16, 440,
+    4, 440, 8, 659, 4, 587, 2, 440, 16, 494, 16, 587, 16, 494, 16, 740, -8, 740, -8, 659, -4, 440,
+    16, 494, 16, 587, 16, 494, 16, 880, 4, 554, 8, 587, -8, 554, 16, 494, 8, 440, 16, 494, 16, 587,
+    16, 494, 16, 587, 4, 659, 8, 554, -8, 494, 16, 440, 4, 440, 8, 659, 4, 587, 2, 0, 4,
 ];
 
 static mut ERROR_LED: Mutex<RefCell<Option<gpio::Pin<'C', 13, Output<PushPull>>>>> =
@@ -149,7 +107,7 @@ fn entry_point() -> ! {
 }
 
 async fn main() {
-    if let (Some(mut dp), Some(mut cp)) = (
+    if let (Some(mut dp), Some(mut _cp)) = (
         pac::Peripherals::take(),
         cortex_m::peripheral::Peripherals::take(),
     ) {
@@ -158,8 +116,11 @@ async fn main() {
 
         cortex_m::interrupt::free(|cs| {
             // SAFETY: Mutex makes access of static mutable variable safe
-            unsafe { ERROR_LED.borrow(cs) }.replace(Some(dp.GPIOC.split().pc13.into_push_pull_output()));
+            unsafe { ERROR_LED.borrow(cs) }
+                .replace(Some(dp.GPIOC.split().pc13.into_push_pull_output()));
         });
+
+        dp.RCC.ahb1enr.modify(|_, w| w.dma1en().enabled());
 
         let rcc = dp.RCC.constrain();
         let clocks = rcc
@@ -173,7 +134,14 @@ async fn main() {
 
         assert!(clocks.is_pll48clk_valid());
 
-        setup_usb(dp.OTG_FS_GLOBAL, dp.OTG_FS_DEVICE, dp.OTG_FS_PWRCLK, gpioa.pa11, gpioa.pa12, &clocks);
+        setup_usb(
+            dp.OTG_FS_GLOBAL,
+            dp.OTG_FS_DEVICE,
+            dp.OTG_FS_PWRCLK,
+            gpioa.pa11,
+            gpioa.pa12,
+            &clocks,
+        );
 
         /* let mut delay = cp.SYST.delay(&clocks);
 
@@ -231,12 +199,11 @@ async fn main() {
             // SAFETY: Mutex makes access of static mutable variable safe
             unsafe { USER_BUTTON.borrow(cs) }.replace(Some(button));
         });
-        
+
         let counter = dp.TIM5.counter_hz(&clocks);
         let pin = gpioa.pa1.into_alternate();
         let led = gpioa.pa5.into_push_pull_output();
         let pwm = dp.TIM2.pwm_hz(pin, 100.kHz(), &clocks).split();
-        
 
         let timer = dp.TIM4.counter_ms(&clocks);
         let i2c1 = I2c::new(dp.I2C1, (gpiob.pb6, gpiob.pb7), 100.kHz(), &clocks);
@@ -244,23 +211,101 @@ async fn main() {
         let f1 = report_sensor_data(i2c1, i2c2, timer);
         let timer = dp.TIM3.counter_ms(&clocks);
 
-        let serial = dp.USART2.serial((gpioa.pa2.into_alternate(), gpioa.pa3.into_alternate()), 9600.bps(), &clocks).unwrap();
+        let radio = dp
+            .USART1
+            .serial(
+                (gpioa.pa15.into_alternate(), gpioa.pa10.into_alternate()),
+                hal::serial::config::Config {
+                    baudrate: 9600.bps(),
+                    dma: DmaConfig::TxRx,
+                    ..Default::default()
+                },
+                &clocks,
+            )
+            .unwrap();
 
-        let f2 = radio_serial(serial, timer);
-        let f3 = rickroll_everyone(pwm, counter, led);
+        radio::setup(dp.DMA2, radio);
 
-        ::futures::join!(f1, f2, f3);
+        hprintln!("hello?");
+        let buf = &mut [0u8; 32];
+        let api_frame = radio::APIFrame::local_command_request(99, *b"ND", [0u8; 32], 0);
+        api_frame.tx(buf).await;
+
+        let mut buffer = [0u8; 32];
+        let mut i = 0;
+        loop {
+            let bytes = radio::rx(&mut buffer).await;
+            if bytes == 0 {
+                continue;
+            }
+            hprintln!("Rx: {:02x?}", &buffer[..bytes]);
+            i += 1;
+            // Wait for two radios to be discovered
+            if i == 1 {
+                let api_frame = radio::APIFrame::parse(&buffer[..bytes]).unwrap();
+                hprintln!("{:?}", api_frame);
+                let data = [0x41; 32];
+                match api_frame {
+                    radio::APIFrame::NetworkDiscoverResponse {
+                        identifier,
+                        identifier_len,
+                        ..
+                    } => {
+                        hprintln!("Disovered device with NI: {}", unsafe {
+                            core::str::from_utf8_unchecked(&identifier[..identifier_len])
+                        });
+                    }
+                    _ => panic!(""),
+                }
+            }
+            if i == 2 {
+                let api_frame = radio::APIFrame::parse(&buffer[..bytes]).unwrap();
+                hprintln!("{:?}", api_frame);
+                let data = [0x41; 32];
+                match api_frame {
+                    radio::APIFrame::NetworkDiscoverResponse {
+                        identifier,
+                        identifier_len,
+                        ..
+                    } => {
+                        hprintln!("Disovered device with NI: {}", unsafe {
+                            core::str::from_utf8_unchecked(&identifier[..identifier_len])
+                        });
+
+                        let tx_req = radio::APIFrame::TransmitRequest {
+                            frame_id: 0x23,
+                            // Send to cansat radio (hopefully relayed through other board)
+                            destination_address: 0x0013A20041EFD44A,
+                            broadcast_radius: 0,
+                            transmit_options: 0x8, // Request route info
+                            data,
+                            data_length: 4,
+                        };
+                        tx_req.tx(&mut buffer).await;
+                    }
+                    _ => panic!(""),
+                }
+            }
+        }
+        //let f3 = rickroll_everyone(pwm, counter, led);
+
+        //f2.await;
     }
 }
 
-async fn rickroll_everyone<const C: u8, LedPin: OutputPin, E: Debug>(mut pwm: timer::PwmChannel<pac::TIM2, C>, mut counter: timer::CounterHz<pac::TIM5>, mut led: LedPin) 
-where LedPin: OutputPin<Error = E> {
+async fn rickroll_everyone<const C: u8, LedPin: OutputPin, E: Debug>(
+    mut pwm: timer::PwmChannel<pac::TIM2, C>,
+    mut counter: timer::CounterHz<pac::TIM5>,
+    mut led: LedPin,
+) where
+    LedPin: OutputPin<Error = E>,
+{
     let chunks = MELODY.chunks(2);
     let note_length_ms: i32 = 60000 * 4 / TEMPO;
     pwm.enable();
     for note_and_duration in chunks {
         loop {
-            let should_rickroll = cortex_m::interrupt::free(|cs| { 
+            let should_rickroll = cortex_m::interrupt::free(|cs| {
                 // SAFETY: Mutex makes access of static mutable variable safe
                 unsafe { *SHOULD_RICKROLL.borrow(cs).borrow() }
             });
@@ -274,16 +319,17 @@ where LedPin: OutputPin<Error = E> {
         let (note, divider) = (note_and_duration[0], note_and_duration[1]);
         // calculates the duration of each note
         let note_duration = if divider > 0 {
-          // regular note, just proceed
+            // regular note, just proceed
             (note_length_ms) / divider
         } else {
-          // dotted notes are represented with negative durations!!
-          (note_length_ms)  * 3 / (-divider) / 2
+            // dotted notes are represented with negative durations!!
+            (note_length_ms) * 3 / (-divider) / 2
         };
 
-
         if note == 0 {
-            counter.start(max((1_000/note_duration) as u32, 1).kHz()).unwrap();
+            counter
+                .start(max((1_000 / note_duration) as u32, 1).kHz())
+                .unwrap();
             NbFuture::new(|| counter.wait()).await.unwrap();
             continue;
         }
@@ -300,7 +346,11 @@ where LedPin: OutputPin<Error = E> {
                 led.set_low().unwrap();
             }
             NbFuture::new(|| counter.wait()).await.unwrap();
-            pulse = if 1000 * n / (note * 2) >= note_duration * 8 / 10 { false } else { !pulse };
+            pulse = if 1000 * n / (note * 2) >= note_duration * 8 / 10 {
+                false
+            } else {
+                !pulse
+            };
             n += 1;
 
             if 1000 * n / (note * 2) >= note_duration {
@@ -312,7 +362,7 @@ where LedPin: OutputPin<Error = E> {
 
 #[interrupt]
 fn EXTI0() {
-    cortex_m::interrupt::free(|cs| 
+    cortex_m::interrupt::free(|cs|
         // SAFETY: Mutex makes access of static mutable variable safe
         {
             let mut btn_ref = unsafe { USER_BUTTON.borrow(cs) }.borrow_mut();
@@ -321,40 +371,6 @@ fn EXTI0() {
             let mut should_rickroll = unsafe { SHOULD_RICKROLL.borrow(cs) }.borrow_mut();
             *should_rickroll = btn.is_low();
     });
-}
-
-async fn radio_serial<TIM, PINS>(
-    serial: Serial<USART2, PINS, u8>,
-    mut timer: CounterMs<TIM>,
-) where
-    TIM: timer::Instance,
-{
-    timer.start(8.millis()).unwrap();
-    let (mut tx, mut rx) = serial.split();
-
-    loop {
-        match rx.read() {
-            Ok(byte) => {
-                get_serial().write(&[byte]).await;
-            }
-            Err(nb::Error::WouldBlock) => {
-            }
-            Err(e) => {
-            }
-        }
-
-        let mut buf = [0u8; 1];
-        match get_serial().read_no_block(&mut buf) {
-            Ok(b) => {
-                nb::block!(tx.write(buf[0])).unwrap();
-            },
-            Err(UsbError::WouldBlock) => {}
-            Err(e) => {}
-        }
-
-        get_serial().poll();
-        NbFuture::new(||timer.wait()).await.unwrap();
-    }
 }
 
 async fn report_sensor_data<TIM, PINS>(
@@ -372,7 +388,6 @@ async fn report_sensor_data<TIM, PINS>(
             mode: bmp388::PowerMode::Normal,
         })
         .unwrap();
-
 
     //let mut bmi055 = BMI055::new(i2c1).unwrap();
     //hprintln!("BMI055: {:?}", bmi055.id().unwrap());
@@ -400,13 +415,13 @@ async fn report_sensor_data<TIM, PINS>(
 
 #[panic_handler]
 pub fn panic(info: &PanicInfo) -> ! {
-        cortex_m::interrupt::free(|cs| {
-            // SAFETY: Mutex makes access of static mutable variable safe
-            let mut led = unsafe { ERROR_LED.borrow(cs).borrow_mut() };
-            if let Some(led) = led.as_mut() {
-                led.set_high();
-            }
-        });
-        // hprintln!("Panic! {}", info);
+    cortex_m::interrupt::free(|cs| {
+        // SAFETY: Mutex makes access of static mutable variable safe
+        let mut led = unsafe { ERROR_LED.borrow(cs).borrow_mut() };
+        if let Some(led) = led.as_mut() {
+            led.set_high();
+        }
+    });
+    hprintln!("Panic! {}", info);
     loop {}
 }

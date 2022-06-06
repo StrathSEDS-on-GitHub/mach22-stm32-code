@@ -35,15 +35,12 @@ where
     }
 }
 
-
 /// Empty future. Await on it in order to yield execution to other tasks.
-pub struct YieldFuture
-{
-    yielded: bool
+pub struct YieldFuture {
+    yielded: bool,
 }
 
-impl Future for YieldFuture
-{
+impl Future for YieldFuture {
     type Output = ();
 
     fn poll(
@@ -60,9 +57,7 @@ impl Future for YieldFuture
     }
 }
 
-impl YieldFuture
-where
-{
+impl YieldFuture {
     pub fn new() -> Self {
         YieldFuture { yielded: false }
     }

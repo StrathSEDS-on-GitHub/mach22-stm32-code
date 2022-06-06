@@ -40,7 +40,7 @@ impl<I2C: i2c::WriteRead> BMI055<I2C> {
         let mut data: [u8; 1] = [0];
         match self.com.write_read(GYRO_ADDR, &[reg as u8], &mut data) {
             Ok(_) => Ok(data[0]),
-            Err(e) => Err(e)
+            Err(e) => Err(e),
         }
     }
 }
