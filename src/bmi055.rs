@@ -4,8 +4,8 @@ use embedded_hal::blocking::i2c;
 const GYRO_ADDR: u8 = 0x68;
 const ACC_ADDR: u8 = 0x18;
 
-pub struct BMI055<I2C: i2c::WriteRead> {
-    com: I2C,
+pub struct BMI055<'a, I2C: i2c::WriteRead> {
+    com: &'a mut I2C,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -19,8 +19,8 @@ pub enum Error<E> {
     InvalidId,
 }
 
-impl<I2C: i2c::WriteRead> BMI055<I2C> {
-    pub fn new<E: core::fmt::Debug>(i2c: I2C) -> Result<Self, Error<E>>
+impl<'a, I2C: i2c::WriteRead> BMI055<'a, I2C> {
+    pub fn new<E: core::fmt::Debug>(i2c: &'a mut I2C) -> Result<Self, Error<E>>
     where
         I2C: i2c::WriteRead<Error = E>,
     {

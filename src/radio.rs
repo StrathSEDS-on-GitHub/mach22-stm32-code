@@ -1,6 +1,5 @@
 use core::{
     cell::RefCell,
-    cmp::min,
     sync::atomic::{AtomicBool, AtomicU32, Ordering},
 };
 
@@ -19,6 +18,61 @@ use stm32f4xx_hal::{
 
 use crate::futures::YieldFuture;
 use stm32f4xx_hal as hal;
+
+pub struct Parser<'a> {
+    idx: usize,
+    data: &'a [u8],
+}
+
+impl<'a> Parser<'a> {
+    pub fn new(data: &'a [u8]) -> Self {
+        Self { idx: 0, data }
+    }
+    pub fn next_u8(self: &mut Self) -> Option<u8> {
+        self.idx += 1;
+        self.data.get(self.idx - 1).copied()
+    }
+
+    pub fn next_u16(self: &mut Self) -> Option<u16> {
+        let it = u16::from_le_bytes(self.data.get(self.idx..self.idx + 2)?.try_into().ok()?);
+        self.idx += 2;
+        Some(it)
+    }
+
+    pub fn next_u64(self: &mut Self) -> Option<u64> {
+        let it = u64::from_le_bytes(self.data.get(self.idx..self.idx + 8)?.try_into().ok()?);
+        self.idx += 8;
+        Some(it)
+    }
+
+    pub fn consume(self: &mut Self, x: u8) -> Option<u8> {
+        if *self.data.get(self.idx)? == x {
+            self.idx += 1;
+            Some(x)
+        } else {
+            None
+        }
+    }
+
+    pub fn next_str(self: &mut Self, len: usize) -> Option<&'a str> {
+        let it =
+            unsafe { core::str::from_utf8_unchecked(self.data.get(self.idx..self.idx + len)?) };
+        self.idx += len;
+        Some(it)
+    }
+
+    pub fn next_null_terminated_str(self: &mut Self) -> Option<&'a str> {
+        let mut idx = self.idx;
+        while *self.data.get(idx)? != 0 {
+            idx += 1;
+        }
+        let it = unsafe {
+            core::str::from_utf8_unchecked(self.data.get(self.idx..idx + 1)?.try_into().ok()?)
+        };
+        self.idx = idx + 1;
+        Some(it)
+    }
+}
 
 static mut TX_TRANSFER: Mutex<
     RefCell<
@@ -42,7 +96,7 @@ static mut RX_TRANSFER: Mutex<
                 4,
                 Rx<pac::USART1>,
                 dma::PeripheralToMemory,
-                &'static mut [u8; 32],
+                &'static mut [u8],
             >,
         >,
     >,
@@ -60,15 +114,8 @@ const RX_BUFFER_SIZE: usize = 32;
 const MAX_COMMAND_DATA_SIZE: usize = 32;
 
 #[derive(Debug)]
-pub enum APIFrame {
-    LocalCommandRequest {
-        frame_id: u8,
-        command: [u8; 2],
-        data: [u8; MAX_COMMAND_DATA_SIZE],
-        data_length: usize,
-    },
+pub enum LocalCommandResponseData {
     NetworkDiscoverResponse {
-        frame_id: u8,
         serial: u64,
         signal_strength: u8,
         identifier: [u8; 20],
@@ -78,6 +125,23 @@ pub enum APIFrame {
         profile_id: u16,
         manufacturer: u16,
     },
+    NoData,
+}
+
+#[derive(Debug)]
+pub enum APIFrame {
+    LocalCommandRequest {
+        frame_id: u8,
+        command: [u8; 2],
+        data: [u8; MAX_COMMAND_DATA_SIZE],
+        data_length: usize,
+    },
+    LocalCommandResponse {
+        frame_id: u8,
+        command: [u8; 2],
+        success: u8,
+        data: LocalCommandResponseData,
+    },
     TransmitRequest {
         frame_id: u8,
         destination_address: u64,
@@ -85,7 +149,7 @@ pub enum APIFrame {
         transmit_options: u8,
         data: [u8; MAX_COMMAND_DATA_SIZE],
         data_length: usize,
-    }
+    },
 }
 
 impl APIFrame {
@@ -106,8 +170,6 @@ impl APIFrame {
     pub fn serialize(self: &Self, buf: &mut [u8]) -> Option<usize> {
         let mut bytes = 3;
         *buf.get_mut(0)? = 0x7E;
-        *buf.get_mut(1)? = (self.len() >> 8) as u8;
-        *buf.get_mut(2)? = (self.len() & 0xFF) as u8;
 
         match self {
             APIFrame::LocalCommandRequest {
@@ -129,7 +191,7 @@ impl APIFrame {
                 buf[6..6 + *data_length].copy_from_slice(&data[..*data_length]);
                 bytes += data_length;
             }
-            APIFrame::NetworkDiscoverResponse { .. } => unimplemented!(),
+            APIFrame::LocalCommandResponse { .. } => unimplemented!(),
             APIFrame::TransmitRequest {
                 frame_id,
                 destination_address,
@@ -140,16 +202,20 @@ impl APIFrame {
             } => {
                 *buf.get_mut(bytes)? = 0x10;
                 *buf.get_mut(bytes + 1)? = *frame_id;
-                buf.get_mut(bytes+2..bytes+10)?.copy_from_slice(&destination_address.to_be_bytes());
+                buf.get_mut(bytes + 2..bytes + 10)?
+                    .copy_from_slice(&destination_address.to_be_bytes());
                 *buf.get_mut(bytes + 10)? = 0xFF;
                 *buf.get_mut(bytes + 11)? = 0xFE;
                 *buf.get_mut(bytes + 12)? = *broadcast_radius;
                 *buf.get_mut(bytes + 13)? = *transmit_options;
-                buf.get_mut(bytes+14..bytes+14+*data_length)?.copy_from_slice(&data[..*data_length]);
+                buf.get_mut(bytes + 14..bytes + 14 + *data_length)?
+                    .copy_from_slice(&data[..*data_length]);
                 bytes += 14 + *data_length;
-
             }
         }
+
+        *buf.get_mut(1)? = (bytes - 3 >> 8) as u8;
+        *buf.get_mut(2)? = (bytes - 3 & 0xFF) as u8;
 
         let checksum = 0xFF
             - buf[3..bytes]
@@ -161,56 +227,66 @@ impl APIFrame {
         Some(bytes)
     }
 
-    pub fn len(self: &Self) -> u16 {
-        match self {
-            APIFrame::LocalCommandRequest { data_length, .. } => 4 + *data_length as u16,
-            APIFrame::NetworkDiscoverResponse { identifier_len, .. } => 16 + *identifier_len as u16,
-            APIFrame::TransmitRequest { data_length, .. } => 14 + *data_length as u16,
-        }
-    }
-
     pub fn parse(buf: &[u8]) -> Option<Self> {
         if buf.len() < 3 {
             return None;
         }
-        match buf.get(3)? {
+        let mut parser = Parser::new(buf);
+        parser.consume(0x7E);
+        let len = parser.next_u16()?;
+
+        match parser.next_u8()? {
             0x08 => unimplemented!(),
             0x88 => {
-                match buf.get(5..7)? {
-                    b"ND" => {
-                        hprintln!("1");
-                        let frame_id = *buf.get(4)?;
-                        let command_success = *buf.get(7)?;
-                        let serial = u64::from_be_bytes(buf.get(10..18)?.try_into().ok()?);
-                        let signal_strength = *buf.get(18)?;
-
-                        let mut identifier_len = 0;
-                        let mut identifier = [0; 20];
-                        hprintln!("2");
-
-                        for &c in buf.get(19..)? {
-                            if c == 0x00 {
-                                break;
-                            }
-                            identifier[identifier_len] = c;
-                            identifier_len += 1;
-                        }
-                        hprintln!("3");
-                        let pos = 18 + identifier_len + 1 + 2;
-
-                        let device_type = *buf.get(pos)?;
-                        let status = *buf.get(pos + 1)?;
-                        let profile_id = u16::from_le_bytes(buf.get(pos + 2..pos + 4)?.try_into().ok()?);
-                        let manufacturer = u16::from_le_bytes(buf.get(pos + 4..pos + 6)?.try_into().ok()?);
-                        hprintln!("4");
-
-
-                        Some(APIFrame::NetworkDiscoverResponse { frame_id, serial, signal_strength, identifier, identifier_len, device_type, status, profile_id, manufacturer})
-                    },
-                    _ => unimplemented!()
+                let frame_id = parser.next_u8()?;
+                let command_name = parser.next_str(2)?;
+                let command_success = parser.next_u8()?;
+                if command_success != 0 {
+                    return Some(APIFrame::LocalCommandResponse {
+                        frame_id,
+                        command: command_name.as_bytes().try_into().unwrap(),
+                        success: command_success,
+                        data: LocalCommandResponseData::NoData,
+                    });
                 }
-            },
-            _ => { todo!() }
+                match command_name {
+                    "ND" => {
+                        parser.next_u16(); // unused.
+
+                        let serial = parser.next_u64()?;
+                        let signal_strength = parser.next_u8()?;
+                        let identifier_str = parser.next_null_terminated_str()?;
+                        let mut identifier = [0u8; 20];
+                        identifier[..identifier_str.len()]
+                            .copy_from_slice(identifier_str.as_bytes());
+
+                        let device_type = parser.next_u8()?;
+                        let status = parser.next_u8()?;
+                        let profile_id = parser.next_u16()?;
+                        let manufacturer = parser.next_u16()?;
+
+                        Some(APIFrame::LocalCommandResponse {
+                            frame_id,
+                            command: command_name.as_bytes().try_into().unwrap(),
+                            success: command_success,
+                            data: LocalCommandResponseData::NetworkDiscoverResponse {
+                                serial,
+                                signal_strength,
+                                identifier,
+                                identifier_len: identifier_str.len(),
+                                device_type,
+                                status,
+                                profile_id,
+                                manufacturer,
+                            },
+                        })
+                    }
+                    _ => todo!("NYI: {}", command_name),
+                }
+            }
+            _ => {
+                todo!("NYI: {:x?}", &buf);
+            }
         }
     }
 
@@ -251,7 +327,7 @@ pub fn setup(
     let mut rx_transfer = Transfer::init_peripheral_to_memory(
         rx_stream,
         rx,
-        rx_buf1,
+        rx_buf1 as &mut [u8],
         None,
         dma::config::DmaConfig::default()
             .memory_increment(true)
@@ -310,7 +386,12 @@ fn DMA2_STREAM5() {
         if Stream5::<pac::DMA2>::get_transfer_complete_flag() {
             transfer.clear_transfer_complete_interrupt();
             let mut rx_buf = unsafe { RX_BUFFER.borrow(cs) }.borrow_mut().take().unwrap();
-            (rx_buf, _) = transfer.next_transfer(rx_buf).unwrap();
+            rx_buf = transfer
+                .next_transfer(rx_buf)
+                .unwrap()
+                .0
+                .try_into()
+                .unwrap();
             RX_COMPLETE.store(true, Ordering::SeqCst);
             RX_BYTES_READ.store(rx_buf.len() as u32, Ordering::SeqCst);
             unsafe { RX_BUFFER.borrow(cs) }.borrow_mut().replace(rx_buf);
@@ -331,7 +412,12 @@ fn USART1() {
 
         let mut rx_buf = unsafe { RX_BUFFER.borrow(cs) }.borrow_mut().take().unwrap();
 
-        (rx_buf, _) = transfer.next_transfer(rx_buf).unwrap();
+        rx_buf = transfer
+            .next_transfer(rx_buf)
+            .unwrap()
+            .0
+            .try_into()
+            .unwrap();
         //hprintln!("idle: {:?} {}", rx_buf, bytes);
         RX_COMPLETE.store(true, Ordering::SeqCst);
         RX_BYTES_READ.store(bytes as u32, Ordering::SeqCst);

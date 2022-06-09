@@ -2,6 +2,7 @@
 #![no_main]
 #![no_std]
 
+use crate::bmi055::BMI055;
 use crate::futures::NbFuture;
 use crate::futures::YieldFuture;
 use crate::hal::timer::TimerExt;
@@ -24,6 +25,7 @@ use hal::dma::Transfer;
 use hal::gpio::Edge;
 use hal::gpio::Input;
 use hal::i2c::I2c;
+use hal::i2c::NoAcknowledgeSource;
 use hal::interrupt;
 use hal::serial::config::DmaConfig;
 use hal::serial::Rx;
@@ -49,6 +51,7 @@ use cortex_m_rt::entry;
 use stm32f4xx_hal as hal;
 mod bmi055;
 mod futures;
+mod mission;
 mod radio;
 mod usb_serial;
 
@@ -226,67 +229,9 @@ async fn main() {
 
         radio::setup(dp.DMA2, radio);
 
-        hprintln!("hello?");
-        let buf = &mut [0u8; 32];
-        let api_frame = radio::APIFrame::local_command_request(99, *b"ND", [0u8; 32], 0);
-        api_frame.tx(buf).await;
+        f1.await;
+        //mission::MissionState::new().start().await;
 
-        let mut buffer = [0u8; 32];
-        let mut i = 0;
-        loop {
-            let bytes = radio::rx(&mut buffer).await;
-            if bytes == 0 {
-                continue;
-            }
-            hprintln!("Rx: {:02x?}", &buffer[..bytes]);
-            i += 1;
-            // Wait for two radios to be discovered
-            if i == 1 {
-                let api_frame = radio::APIFrame::parse(&buffer[..bytes]).unwrap();
-                hprintln!("{:?}", api_frame);
-                let data = [0x41; 32];
-                match api_frame {
-                    radio::APIFrame::NetworkDiscoverResponse {
-                        identifier,
-                        identifier_len,
-                        ..
-                    } => {
-                        hprintln!("Disovered device with NI: {}", unsafe {
-                            core::str::from_utf8_unchecked(&identifier[..identifier_len])
-                        });
-                    }
-                    _ => panic!(""),
-                }
-            }
-            if i == 2 {
-                let api_frame = radio::APIFrame::parse(&buffer[..bytes]).unwrap();
-                hprintln!("{:?}", api_frame);
-                let data = [0x41; 32];
-                match api_frame {
-                    radio::APIFrame::NetworkDiscoverResponse {
-                        identifier,
-                        identifier_len,
-                        ..
-                    } => {
-                        hprintln!("Disovered device with NI: {}", unsafe {
-                            core::str::from_utf8_unchecked(&identifier[..identifier_len])
-                        });
-
-                        let tx_req = radio::APIFrame::TransmitRequest {
-                            frame_id: 0x23,
-                            // Send to cansat radio (hopefully relayed through other board)
-                            destination_address: 0x0013A20041EFD44A,
-                            broadcast_radius: 0,
-                            transmit_options: 0x8, // Request route info
-                            data,
-                            data_length: 4,
-                        };
-                        tx_req.tx(&mut buffer).await;
-                    }
-                    _ => panic!(""),
-                }
-            }
-        }
         //let f3 = rickroll_everyone(pwm, counter, led);
 
         //f2.await;
@@ -374,13 +319,14 @@ fn EXTI0() {
 }
 
 async fn report_sensor_data<TIM, PINS>(
-    i2c1: I2c<pac::I2C1, PINS>,
-    i2c2: I2c<pac::I2C2, (gpio::Pin<'B', 10>, gpio::Pin<'B', 9>)>,
+    mut i2c1: I2c<pac::I2C1, PINS>,
+    mut i2c2: I2c<pac::I2C2, (gpio::Pin<'B', 10>, gpio::Pin<'B', 9>)>,
     mut timer: CounterMs<TIM>,
 ) where
     TIM: timer::Instance,
 {
-    let mut bmp388 = BMP388::new(i2c2).unwrap();
+    /*let mut bmp388 = BMP388::new(i2c2).unwrap();
+    hprintln!("BMP388 initialized");
     bmp388
         .set_power_control(bmp388::PowerControl {
             pressure_enable: true,
@@ -388,11 +334,12 @@ async fn report_sensor_data<TIM, PINS>(
             mode: bmp388::PowerMode::Normal,
         })
         .unwrap();
-
-    //let mut bmi055 = BMI055::new(i2c1).unwrap();
-    //hprintln!("BMI055: {:?}", bmi055.id().unwrap());
-
-    timer.start(5000.millis()).unwrap();
+    hprintln!("BMP388 initialized");
+    */
+    let mut bmi055 = BMI055::new(&mut i2c1);
+    hprintln!("{:?}", bmi055.err())
+    /*
+    timer.start(500.millis()).unwrap();
     loop {
         bmp388
             .sensor_values()
@@ -401,16 +348,16 @@ async fn report_sensor_data<TIM, PINS>(
                     * (pow((values.pressure) / 101325.0, 1.0 / 5.257) - 1.0)
                     * values.temperature;
 
-                /*hprintln!(
+                hprintln!(
                     "Temperature: {:.2}°C, Pressure: {:.2}Pa, Altitude: {:.2}m",
                     values.temperature,
                     values.pressure,
                     alt
-                );*/
+                );
             })
             .unwrap();
         NbFuture::new(|| timer.wait()).await.unwrap();
-    }
+    }*/
 }
 
 #[panic_handler]
