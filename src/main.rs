@@ -2,34 +2,27 @@
 #![no_main]
 #![no_std]
 
-use crate::bmi055::BMI055;
 use crate::futures::NbFuture;
 use crate::futures::YieldFuture;
 use crate::hal::timer::TimerExt;
+use crate::mission::MissionState;
 use crate::usb_serial::setup_usb;
 use bmp388::BMP388;
 use cassette::pin_mut;
 use cassette::Cassette;
-use cortex_m::asm::delay;
 use cortex_m::interrupt::Mutex;
 use cortex_m_semihosting::hprintln;
 use embedded_hal::digital::v2::OutputPin;
+use ::futures::join;
+use hal::adc::Adc;
 use hal::dma;
-use hal::dma::traits::Stream;
-use hal::dma::traits::StreamISR;
-use hal::dma::Stream5;
-use hal::dma::Stream6;
-use hal::dma::Stream7;
-use hal::dma::StreamsTuple;
+use hal::dma::Stream0;
 use hal::dma::Transfer;
 use hal::gpio::Edge;
 use hal::gpio::Input;
 use hal::i2c::I2c;
-use hal::i2c::NoAcknowledgeSource;
 use hal::interrupt;
-use hal::serial::config::DmaConfig;
-use hal::serial::Rx;
-use hal::serial::Tx;
+use hal::pac::ADC1;
 use hal::timer;
 use hal::timer::CounterMs;
 use libm::pow;
@@ -38,10 +31,6 @@ use core::cell::RefCell;
 use core::cmp::max;
 use core::fmt::Debug;
 use core::panic::PanicInfo;
-use core::slice;
-use core::sync::atomic::AtomicBool;
-use core::sync::atomic::AtomicU32;
-use core::sync::atomic::Ordering;
 use hal::gpio;
 use hal::gpio::Output;
 use hal::gpio::PushPull;
@@ -109,8 +98,20 @@ fn entry_point() -> ! {
     loop {}
 }
 
+const ADC_BUF_LEN: usize = 32;
+static mut ADC_BUFFER: Mutex<RefCell<Option<&'static mut [u16; ADC_BUF_LEN]>>> =
+    Mutex::new(RefCell::new(None));
+
+static mut ADC_TRANSFER: Mutex<
+    RefCell<
+        Option<
+            Transfer<Stream0<pac::DMA2>, 0, Adc<ADC1>, dma::PeripheralToMemory, &'static mut [u16]>,
+        >,
+    >,
+> = Mutex::new(RefCell::new(None));
+
 async fn main() {
-    if let (Some(mut dp), Some(mut _cp)) = (
+    if let (Some(mut dp), Some(mut cp)) = (
         pac::Peripherals::take(),
         cortex_m::peripheral::Peripherals::take(),
     ) {
@@ -209,32 +210,41 @@ async fn main() {
         let pwm = dp.TIM2.pwm_hz(pin, 100.kHz(), &clocks).split();
 
         let timer = dp.TIM4.counter_ms(&clocks);
-        let i2c1 = I2c::new(dp.I2C1, (gpiob.pb6, gpiob.pb7), 100.kHz(), &clocks);
         let i2c2 = I2c::new(dp.I2C2, (gpiob.pb10, gpiob.pb9), 100.kHz(), &clocks);
-        let f1 = report_sensor_data(i2c1, i2c2, timer);
+        let f1 = report_sensor_data(i2c2, timer);
         let timer = dp.TIM3.counter_ms(&clocks);
 
-        let radio = dp
-            .USART1
+        let gps = dp
+            .USART2
             .serial(
-                (gpioa.pa15.into_alternate(), gpioa.pa10.into_alternate()),
+                (gpioa.pa2.into_alternate(), gpioa.pa3.into_alternate()),
                 hal::serial::config::Config {
-                    baudrate: 9600.bps(),
-                    dma: DmaConfig::TxRx,
+                    baudrate: 64000.bps(),
+                    dma: hal::serial::config::DmaConfig::TxRx,
                     ..Default::default()
                 },
                 &clocks,
             )
             .unwrap();
 
-        radio::setup(dp.DMA2, radio);
+        radio::setup(dp.DMA1, gps);
 
-        f1.await;
-        //mission::MissionState::new().start().await;
+        let swo_freq = 64000;
+        let prescaler = (clocks.sysclk().raw() / swo_freq) - 1;
+        unsafe {
+            cp.DCB.demcr.modify(|r| r | 1 << 24); // TRCENA
+            cp.TPIU.sppr.write(0b01); // SWO Manchester
+            dp.DBGMCU.cr.write(|w| w.bits(1 << 5)); // TRACE_IOEN
+            cp.ITM.lar.write(0xC5ACCE55);
+            cp.ITM.tcr.write(0x00010005);
+            cp.ITM.ter[0].write(0x01);
+            cp.ITM.tpr.write(0x01);
+            cp.TPIU.acpr.write(prescaler);
+            cp.TPIU.ffcr.write(0x100)
+        }
 
-        //let f3 = rickroll_everyone(pwm, counter, led);
-
-        //f2.await;
+        let mut mission = MissionState::new();
+        join!(f1, mission.start());
     }
 }
 
@@ -319,13 +329,12 @@ fn EXTI0() {
 }
 
 async fn report_sensor_data<TIM, PINS>(
-    mut i2c1: I2c<pac::I2C1, PINS>,
-    mut i2c2: I2c<pac::I2C2, (gpio::Pin<'B', 10>, gpio::Pin<'B', 9>)>,
+    i2c2: I2c<pac::I2C2, PINS>,
     mut timer: CounterMs<TIM>,
 ) where
     TIM: timer::Instance,
 {
-    /*let mut bmp388 = BMP388::new(i2c2).unwrap();
+    let mut bmp388 = BMP388::new(i2c2).unwrap();
     hprintln!("BMP388 initialized");
     bmp388
         .set_power_control(bmp388::PowerControl {
@@ -334,12 +343,8 @@ async fn report_sensor_data<TIM, PINS>(
             mode: bmp388::PowerMode::Normal,
         })
         .unwrap();
-    hprintln!("BMP388 initialized");
-    */
-    let mut bmi055 = BMI055::new(&mut i2c1);
-    hprintln!("{:?}", bmi055.err())
-    /*
-    timer.start(500.millis()).unwrap();
+
+    timer.start(5000.millis()).unwrap();
     loop {
         bmp388
             .sensor_values()
@@ -357,7 +362,7 @@ async fn report_sensor_data<TIM, PINS>(
             })
             .unwrap();
         NbFuture::new(|| timer.wait()).await.unwrap();
-    }*/
+    }
 }
 
 #[panic_handler]

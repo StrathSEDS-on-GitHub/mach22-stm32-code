@@ -1,11 +1,15 @@
 use core::{
     cell::RefCell,
-    sync::atomic::{AtomicBool, AtomicU32, Ordering},
+    sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering},
 };
 
 use cortex_m::interrupt::Mutex;
 use cortex_m_semihosting::hprintln;
-use hal::{dma::StreamsTuple, gpio};
+use hal::{
+    dma::{Stream6, StreamsTuple},
+    gpio,
+};
+use heapless::{String, Vec};
 use stm32f4xx_hal::{
     dma::{
         self,
@@ -19,12 +23,12 @@ use stm32f4xx_hal::{
 use crate::futures::YieldFuture;
 use stm32f4xx_hal as hal;
 
-pub struct Parser<'a> {
+pub struct Lexer<'a> {
     idx: usize,
     data: &'a [u8],
 }
 
-impl<'a> Parser<'a> {
+impl<'a> Lexer<'a> {
     pub fn new(data: &'a [u8]) -> Self {
         Self { idx: 0, data }
     }
@@ -72,15 +76,19 @@ impl<'a> Parser<'a> {
         self.idx = idx + 1;
         Some(it)
     }
+
+    pub fn at_end(self: &Self) -> bool {
+        self.idx == self.data.len()
+    }
 }
 
 static mut TX_TRANSFER: Mutex<
     RefCell<
         Option<
             Transfer<
-                Stream7<pac::DMA2>,
+                Stream6<pac::DMA1>,
                 4,
-                Tx<pac::USART1>,
+                Tx<pac::USART2>,
                 dma::MemoryToPeripheral,
                 &'static mut [u8],
             >,
@@ -92,9 +100,9 @@ static mut RX_TRANSFER: Mutex<
     RefCell<
         Option<
             Transfer<
-                Stream5<pac::DMA2>,
+                Stream5<pac::DMA1>,
                 4,
-                Rx<pac::USART1>,
+                Rx<pac::USART2>,
                 dma::PeripheralToMemory,
                 &'static mut [u8],
             >,
@@ -109,17 +117,96 @@ static TX_COMPLETE: AtomicBool = AtomicBool::new(false);
 static RX_COMPLETE: AtomicBool = AtomicBool::new(false);
 static RX_BYTES_READ: AtomicU32 = AtomicU32::new(0);
 
-const RX_BUFFER_SIZE: usize = 32;
+const RX_BUFFER_SIZE: usize = 512;
 
-const MAX_COMMAND_DATA_SIZE: usize = 32;
+const MAX_PAYLOAD_SIZE: usize = 0x100;
+
+pub struct Parser<'a> {
+    lexer: Lexer<'a>,
+    buf: &'a [u8],
+}
+
+impl<'a> Parser<'a> {
+    pub fn new(buf: &'a [u8]) -> Self {
+        Self {
+            lexer: Lexer::new(buf),
+            buf,
+        }
+    }
+}
+
+impl Iterator for Parser<'_> {
+    type Item = Option<APIFrame>;
+    // FIXME: doesn't handle fragmented packets
+    fn next(&mut self) -> Option<Self::Item> {
+        let buf = self.buf;
+        if buf.len() == 0 || self.lexer.at_end() {
+            return None;
+        }
+
+        let lexer = &mut self.lexer;
+        lexer.consume(0x7E);
+        let len = lexer.next_u16()?;
+
+        match lexer.next_u8()? {
+            0x08 => unimplemented!(),
+            0x88 => {
+                let frame_id = lexer.next_u8()?;
+                let command_name = lexer.next_str(2)?;
+                let command_success = lexer.next_u8()?;
+                if command_success != 0 {
+                    return Some(Some(APIFrame::LocalCommandResponse {
+                        frame_id,
+                        command: command_name.as_bytes().try_into().unwrap(),
+                        success: command_success,
+                        data: LocalCommandResponseData::NoData,
+                    }));
+                }
+                match command_name {
+                    "ND" => {
+                        lexer.next_u16(); // unused.
+
+                        let serial = lexer.next_u64()?;
+                        let signal_strength = lexer.next_u8()?;
+                        let identifier_str = lexer.next_null_terminated_str()?;
+                        let mut identifier = String::from(identifier_str);
+
+                        let device_type = lexer.next_u8()?;
+                        let status = lexer.next_u8()?;
+                        let profile_id = lexer.next_u16()?;
+                        let manufacturer = lexer.next_u16()?;
+
+                        Some(Some(APIFrame::LocalCommandResponse {
+                            frame_id,
+                            command: command_name.as_bytes().try_into().unwrap(),
+                            success: command_success,
+                            data: LocalCommandResponseData::NetworkDiscoverResponse {
+                                serial,
+                                signal_strength,
+                                identifier,
+                                device_type,
+                                status,
+                                profile_id,
+                                manufacturer,
+                            },
+                        }))
+                    }
+                    _ => todo!("NYI: {}", command_name),
+                }
+            }
+            _ => {
+                todo!("NYI: {:x?}", &buf);
+            }
+        }
+    }
+}
 
 #[derive(Debug)]
 pub enum LocalCommandResponseData {
     NetworkDiscoverResponse {
         serial: u64,
         signal_strength: u8,
-        identifier: [u8; 20],
-        identifier_len: usize,
+        identifier: String<20>,
         device_type: u8,
         status: u8,
         profile_id: u16,
@@ -133,7 +220,7 @@ pub enum APIFrame {
     LocalCommandRequest {
         frame_id: u8,
         command: [u8; 2],
-        data: [u8; MAX_COMMAND_DATA_SIZE],
+        data: [u8; MAX_PAYLOAD_SIZE],
         data_length: usize,
     },
     LocalCommandResponse {
@@ -147,16 +234,47 @@ pub enum APIFrame {
         destination_address: u64,
         broadcast_radius: u8,
         transmit_options: u8,
-        data: [u8; MAX_COMMAND_DATA_SIZE],
+        data: [u8; MAX_PAYLOAD_SIZE],
         data_length: usize,
     },
+    ReceivePacket {
+        frame_id: u8,
+        source_address: u64,
+        recv_options: u8,
+        payload: [u8; MAX_PAYLOAD_SIZE],
+    }
+}
+
+static ID_COUNTER: AtomicU8 = AtomicU8::new(0);
+
+pub fn next_id() -> u8 {
+    ID_COUNTER.fetch_add(1, Ordering::SeqCst)
+}
+
+static mut UNHANDLED_FRAMES: Mutex<RefCell<Vec<APIFrame, 32>>> =
+    Mutex::new(RefCell::new(Vec::new()));
+
+pub fn try_claim_frame<F>(f: F) -> Option<APIFrame>
+where
+    F: FnOnce(&APIFrame) -> bool,
+{
+    cortex_m::interrupt::free(|cs| {
+        let mut frames = unsafe { UNHANDLED_FRAMES.borrow(cs) }.borrow();
+        for i in 0..frames.len() {
+            if f(&frames[i]) {
+                let frame = frames.swap_remove(i);
+                return Some(frame);
+            }
+        }
+        None
+    })
 }
 
 impl APIFrame {
     pub fn local_command_request(
         frame_id: u8,
         command: [u8; 2],
-        data: [u8; MAX_COMMAND_DATA_SIZE],
+        data: [u8; MAX_PAYLOAD_SIZE],
         data_length: usize,
     ) -> Self {
         APIFrame::LocalCommandRequest {
@@ -212,6 +330,7 @@ impl APIFrame {
                     .copy_from_slice(&data[..*data_length]);
                 bytes += 14 + *data_length;
             }
+            APIFrame::ReceivePacket { frame_id, source_address, recv_options, payload } => unimplemented!(),
         }
 
         *buf.get_mut(1)? = (bytes - 3 >> 8) as u8;
@@ -227,87 +346,55 @@ impl APIFrame {
         Some(bytes)
     }
 
-    pub fn parse(buf: &[u8]) -> Option<Self> {
-        if buf.len() < 3 {
-            return None;
-        }
-        let mut parser = Parser::new(buf);
-        parser.consume(0x7E);
-        let len = parser.next_u16()?;
-
-        match parser.next_u8()? {
-            0x08 => unimplemented!(),
-            0x88 => {
-                let frame_id = parser.next_u8()?;
-                let command_name = parser.next_str(2)?;
-                let command_success = parser.next_u8()?;
-                if command_success != 0 {
-                    return Some(APIFrame::LocalCommandResponse {
-                        frame_id,
-                        command: command_name.as_bytes().try_into().unwrap(),
-                        success: command_success,
-                        data: LocalCommandResponseData::NoData,
-                    });
-                }
-                match command_name {
-                    "ND" => {
-                        parser.next_u16(); // unused.
-
-                        let serial = parser.next_u64()?;
-                        let signal_strength = parser.next_u8()?;
-                        let identifier_str = parser.next_null_terminated_str()?;
-                        let mut identifier = [0u8; 20];
-                        identifier[..identifier_str.len()]
-                            .copy_from_slice(identifier_str.as_bytes());
-
-                        let device_type = parser.next_u8()?;
-                        let status = parser.next_u8()?;
-                        let profile_id = parser.next_u16()?;
-                        let manufacturer = parser.next_u16()?;
-
-                        Some(APIFrame::LocalCommandResponse {
-                            frame_id,
-                            command: command_name.as_bytes().try_into().unwrap(),
-                            success: command_success,
-                            data: LocalCommandResponseData::NetworkDiscoverResponse {
-                                serial,
-                                signal_strength,
-                                identifier,
-                                identifier_len: identifier_str.len(),
-                                device_type,
-                                status,
-                                profile_id,
-                                manufacturer,
-                            },
-                        })
-                    }
-                    _ => todo!("NYI: {}", command_name),
-                }
-            }
-            _ => {
-                todo!("NYI: {:x?}", &buf);
-            }
-        }
-    }
-
     pub async fn tx(self: &Self, buf: &mut [u8]) {
         let bytes = self.serialize(buf).unwrap();
         crate::radio::tx(&buf[..bytes]).await;
     }
+
+    pub async fn await_response(self: &Self) -> APIFrame {
+        let mut rx_buf = [0u8; RX_BUFFER_SIZE];
+        loop {
+            let bytes = crate::radio::rx(&mut rx_buf).await;
+            for frame in Parser::new(&rx_buf[..bytes]) {
+                if let Some(frame) = frame {
+                    if frame.frame_id() == self.frame_id() {
+                        return frame;
+                    } else {
+                        cortex_m::interrupt::free(|cs| {
+                            unsafe { UNHANDLED_FRAMES.borrow(cs) }
+                                .borrow_mut()
+                                .push(frame);
+                        });
+                    }
+                } else {
+                    hprintln!("warn: invalid frame received");
+                }
+            }
+        }
+    }
+
+    pub fn frame_id(self: &Self) -> u8 {
+        match self {
+            APIFrame::LocalCommandRequest { frame_id, .. } => *frame_id,
+            APIFrame::LocalCommandResponse { frame_id, .. } => *frame_id,
+            APIFrame::TransmitRequest { frame_id, .. } => *frame_id,
+            APIFrame::ReceivePacket { frame_id, .. } => *frame_id,
+        }
+    }
 }
 
 pub fn setup(
-    dma2: pac::DMA2,
+    DMA1: pac::DMA1,
     radio: hal::serial::Serial<
-        pac::USART1,
+        pac::USART2,
         (
-            gpio::Pin<'A', 15, gpio::Alternate<7>>,
-            gpio::Pin<'A', 10, gpio::Alternate<7>>,
+            gpio::Pin<'A', 2, gpio::Alternate<7>>,
+            gpio::Pin<'A', 3, gpio::Alternate<7>>,
         ),
     >,
 ) {
-    let streams = StreamsTuple::new(dma2);
-    let tx_stream = streams.7;
+    let streams = StreamsTuple::new(DMA1);
+    let tx_stream = streams.6;
     let rx_stream = streams.5;
     let tx_buf = cortex_m::singleton!(:[u8; 32] = [0; 32]).unwrap();
     let rx_buf1 = cortex_m::singleton!(:[u8; RX_BUFFER_SIZE] = [0; RX_BUFFER_SIZE]).unwrap();
@@ -346,25 +433,25 @@ pub fn setup(
         unsafe { RX_BUFFER.borrow(cs) }.replace(Some(rx_buf2));
     });
     unsafe {
-        cortex_m::peripheral::NVIC::unmask(pac::Interrupt::DMA2_STREAM7);
-        cortex_m::peripheral::NVIC::unmask(pac::Interrupt::DMA2_STREAM5);
-        cortex_m::peripheral::NVIC::unmask(pac::Interrupt::USART1);
+        cortex_m::peripheral::NVIC::unmask(pac::Interrupt::DMA1_STREAM6);
+        cortex_m::peripheral::NVIC::unmask(pac::Interrupt::DMA1_STREAM5);
+        cortex_m::peripheral::NVIC::unmask(pac::Interrupt::USART2);
     }
 }
 
 /// Interrupt for radio DMA TX,
 #[interrupt]
-fn DMA2_STREAM7() {
+fn DMA1_STREAM6() {
     cortex_m::interrupt::free(|cs| {
         let mut transfer_ref = unsafe { TX_TRANSFER.borrow(cs) }.borrow_mut();
         let transfer = transfer_ref.as_mut().unwrap();
 
         // Its important to clear fifo errors as the transfer is paused until it is cleared
-        if Stream7::<pac::DMA2>::get_fifo_error_flag() {
+        if Stream6::<pac::DMA1>::get_fifo_error_flag() {
             transfer.clear_fifo_error_interrupt();
         }
 
-        if Stream7::<pac::DMA2>::get_transfer_complete_flag() {
+        if Stream6::<pac::DMA1>::get_transfer_complete_flag() {
             transfer.clear_transfer_complete_interrupt();
             // FIXME: A less restrictive ordering is probably possible
             TX_COMPLETE.store(true, Ordering::SeqCst);
@@ -374,16 +461,16 @@ fn DMA2_STREAM7() {
 
 // Interrupt for radio DMA RX.
 #[interrupt]
-fn DMA2_STREAM5() {
+fn DMA1_STREAM5() {
     cortex_m::interrupt::free(|cs| {
         let mut transfer_ref = unsafe { RX_TRANSFER.borrow(cs) }.borrow_mut();
         let transfer = transfer_ref.as_mut().unwrap();
 
         // Its important to clear fifo errors as the transfer is paused until it is cleared
-        if Stream5::<pac::DMA2>::get_fifo_error_flag() {
+        if Stream5::<pac::DMA1>::get_fifo_error_flag() {
             transfer.clear_fifo_error_interrupt();
         }
-        if Stream5::<pac::DMA2>::get_transfer_complete_flag() {
+        if Stream5::<pac::DMA1>::get_transfer_complete_flag() {
             transfer.clear_transfer_complete_interrupt();
             let mut rx_buf = unsafe { RX_BUFFER.borrow(cs) }.borrow_mut().take().unwrap();
             rx_buf = transfer
@@ -392,6 +479,7 @@ fn DMA2_STREAM5() {
                 .0
                 .try_into()
                 .unwrap();
+            //hprintln!("tc: {:?}", rx_buf);
             RX_COMPLETE.store(true, Ordering::SeqCst);
             RX_BYTES_READ.store(rx_buf.len() as u32, Ordering::SeqCst);
             unsafe { RX_BUFFER.borrow(cs) }.borrow_mut().replace(rx_buf);
@@ -400,12 +488,12 @@ fn DMA2_STREAM5() {
 }
 
 #[interrupt]
-fn USART1() {
+fn USART2() {
     cortex_m::interrupt::free(|cs| {
         let mut transfer_ref = unsafe { RX_TRANSFER.borrow(cs) }.borrow_mut();
         let transfer = transfer_ref.as_mut().unwrap();
 
-        let bytes = RX_BUFFER_SIZE as u16 - Stream5::<pac::DMA2>::get_number_of_transfers();
+        let bytes = RX_BUFFER_SIZE as u16 - Stream5::<pac::DMA1>::get_number_of_transfers();
         transfer.pause(|rx| {
             rx.clear_idle_interrupt();
         });
@@ -418,7 +506,7 @@ fn USART1() {
             .0
             .try_into()
             .unwrap();
-        //hprintln!("idle: {:?} {}", rx_buf, bytes);
+        // hprintln!("idle: {:?} {}", rx_buf, bytes);
         RX_COMPLETE.store(true, Ordering::SeqCst);
         RX_BYTES_READ.store(bytes as u32, Ordering::SeqCst);
 
