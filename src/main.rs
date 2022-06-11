@@ -214,12 +214,12 @@ async fn main() {
         let f1 = report_sensor_data(i2c2, timer);
         let timer = dp.TIM3.counter_ms(&clocks);
 
-        let gps = dp
-            .USART2
+        let radio = dp
+            .USART1
             .serial(
-                (gpioa.pa2.into_alternate(), gpioa.pa3.into_alternate()),
+                (gpioa.pa15.into_alternate(), gpioa.pa10.into_alternate()),
                 hal::serial::config::Config {
-                    baudrate: 64000.bps(),
+                    baudrate: 9600.bps(),
                     dma: hal::serial::config::DmaConfig::TxRx,
                     ..Default::default()
                 },
@@ -227,21 +227,7 @@ async fn main() {
             )
             .unwrap();
 
-        radio::setup(dp.DMA1, gps);
-
-        let swo_freq = 64000;
-        let prescaler = (clocks.sysclk().raw() / swo_freq) - 1;
-        unsafe {
-            cp.DCB.demcr.modify(|r| r | 1 << 24); // TRCENA
-            cp.TPIU.sppr.write(0b01); // SWO Manchester
-            dp.DBGMCU.cr.write(|w| w.bits(1 << 5)); // TRACE_IOEN
-            cp.ITM.lar.write(0xC5ACCE55);
-            cp.ITM.tcr.write(0x00010005);
-            cp.ITM.ter[0].write(0x01);
-            cp.ITM.tpr.write(0x01);
-            cp.TPIU.acpr.write(prescaler);
-            cp.TPIU.ffcr.write(0x100)
-        }
+        radio::setup(dp.DMA2, radio);
 
         let mut mission = MissionState::new();
         join!(f1, mission.start());
@@ -353,12 +339,12 @@ async fn report_sensor_data<TIM, PINS>(
                     * (pow((values.pressure) / 101325.0, 1.0 / 5.257) - 1.0)
                     * values.temperature;
 
-                hprintln!(
+                /*hprintln!(
                     "Temperature: {:.2}°C, Pressure: {:.2}Pa, Altitude: {:.2}m",
                     values.temperature,
                     values.pressure,
                     alt
-                );
+                );*/
             })
             .unwrap();
         NbFuture::new(|| timer.wait()).await.unwrap();

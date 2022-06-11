@@ -1,12 +1,13 @@
 use core::{
     cell::RefCell,
-    sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering},
+    cmp::min,
+    sync::atomic::{AtomicBool, AtomicU32, AtomicU8, AtomicUsize, Ordering},
 };
 
 use cortex_m::interrupt::Mutex;
 use cortex_m_semihosting::hprintln;
 use hal::{
-    dma::{Stream6, StreamsTuple},
+    dma::{Stream7, StreamsTuple},
     gpio,
 };
 use heapless::{String, Vec};
@@ -14,7 +15,7 @@ use stm32f4xx_hal::{
     dma::{
         self,
         traits::{Stream, StreamISR},
-        Stream5, Stream7, Transfer,
+        Stream5, Transfer,
     },
     interrupt, pac,
     serial::{Rx, Tx},
@@ -32,19 +33,24 @@ impl<'a> Lexer<'a> {
     pub fn new(data: &'a [u8]) -> Self {
         Self { idx: 0, data }
     }
+
+    pub fn remaining_bytes(&self) -> usize {
+        self.data.len() - self.idx
+    }
+
     pub fn next_u8(self: &mut Self) -> Option<u8> {
         self.idx += 1;
         self.data.get(self.idx - 1).copied()
     }
 
     pub fn next_u16(self: &mut Self) -> Option<u16> {
-        let it = u16::from_le_bytes(self.data.get(self.idx..self.idx + 2)?.try_into().ok()?);
+        let it = u16::from_be_bytes(self.data.get(self.idx..self.idx + 2)?.try_into().ok()?);
         self.idx += 2;
         Some(it)
     }
 
     pub fn next_u64(self: &mut Self) -> Option<u64> {
-        let it = u64::from_le_bytes(self.data.get(self.idx..self.idx + 8)?.try_into().ok()?);
+        let it = u64::from_be_bytes(self.data.get(self.idx..self.idx + 8)?.try_into().ok()?);
         self.idx += 8;
         Some(it)
     }
@@ -65,13 +71,19 @@ impl<'a> Lexer<'a> {
         Some(it)
     }
 
+    pub fn next_bytes(self: &mut Self, len: usize) -> Option<&'a [u8]> {
+        let it = self.data.get(self.idx..self.idx + len)?;
+        self.idx += len;
+        Some(it)
+    }
+
     pub fn next_null_terminated_str(self: &mut Self) -> Option<&'a str> {
         let mut idx = self.idx;
         while *self.data.get(idx)? != 0 {
             idx += 1;
         }
         let it = unsafe {
-            core::str::from_utf8_unchecked(self.data.get(self.idx..idx + 1)?.try_into().ok()?)
+            core::str::from_utf8_unchecked(self.data.get(self.idx..idx)?.try_into().ok()?)
         };
         self.idx = idx + 1;
         Some(it)
@@ -80,15 +92,28 @@ impl<'a> Lexer<'a> {
     pub fn at_end(self: &Self) -> bool {
         self.idx == self.data.len()
     }
+
+    pub fn skip_till(&mut self, arg: u8) -> Option<u8> {
+        while self.next_u8()? != arg {}
+        Some(arg)
+    }
+
+    fn pos(&self) -> usize {
+        self.idx
+    }
+
+    pub fn set_pos(&mut self, pos: usize) {
+        self.idx = pos;
+    }
 }
 
 static mut TX_TRANSFER: Mutex<
     RefCell<
         Option<
             Transfer<
-                Stream6<pac::DMA1>,
+                Stream7<pac::DMA2>,
                 4,
-                Tx<pac::USART2>,
+                Tx<pac::USART1>,
                 dma::MemoryToPeripheral,
                 &'static mut [u8],
             >,
@@ -100,9 +125,9 @@ static mut RX_TRANSFER: Mutex<
     RefCell<
         Option<
             Transfer<
-                Stream5<pac::DMA1>,
+                Stream5<pac::DMA2>,
                 4,
-                Rx<pac::USART2>,
+                Rx<pac::USART1>,
                 dma::PeripheralToMemory,
                 &'static mut [u8],
             >,
@@ -115,47 +140,70 @@ static mut RX_BUFFER: Mutex<RefCell<Option<&'static mut [u8; RX_BUFFER_SIZE]>>> 
 
 static TX_COMPLETE: AtomicBool = AtomicBool::new(false);
 static RX_COMPLETE: AtomicBool = AtomicBool::new(false);
-static RX_BYTES_READ: AtomicU32 = AtomicU32::new(0);
+static RX_BYTES_READ: AtomicUsize = AtomicUsize::new(0);
 
 const RX_BUFFER_SIZE: usize = 512;
 
 const MAX_PAYLOAD_SIZE: usize = 0x100;
 
 pub struct Parser<'a> {
-    lexer: Lexer<'a>,
+    lexer: RefCell<Lexer<'a>>,
     buf: &'a [u8],
 }
 
 impl<'a> Parser<'a> {
     pub fn new(buf: &'a [u8]) -> Self {
         Self {
-            lexer: Lexer::new(buf),
+            lexer: RefCell::new(Lexer::new(buf)),
             buf,
         }
     }
+
+    fn pos(&self) -> usize {
+        self.lexer.borrow().pos()
+    }
 }
 
-impl Iterator for Parser<'_> {
+impl<'a> Iterator for &'a Parser<'_> {
     type Item = Option<APIFrame>;
-    // FIXME: doesn't handle fragmented packets
-    fn next(&mut self) -> Option<Self::Item> {
+    fn next(self: &mut Self) -> Option<Self::Item> {
+        let mut lexer = self.lexer.borrow_mut();
         let buf = self.buf;
-        if buf.len() == 0 || self.lexer.at_end() {
+
+        if buf.len() == 0 || lexer.at_end() {
             return None;
         }
 
-        let lexer = &mut self.lexer;
-        lexer.consume(0x7E);
+        match lexer.consume(0x7E) {
+            Some(_) => {}
+            None => {
+                hprintln!("warn: incorrect start byte. dropping some unknown bytes");
+                lexer.skip_till(0x7E);
+            }
+        }
         let len = lexer.next_u16()?;
 
-        match lexer.next_u8()? {
+        if lexer.remaining_bytes() < len as usize {
+            hprintln!(
+                "warn: incorrect length {}, {}",
+                len,
+                lexer.remaining_bytes()
+            );
+            // Rewind to the start of the frame
+            let pos = lexer.pos();
+            lexer.set_pos(pos - 3);
+            // The full packet is not yet available
+            return None;
+        }
+
+        let result = match lexer.next_u8()? {
             0x08 => unimplemented!(),
             0x88 => {
                 let frame_id = lexer.next_u8()?;
                 let command_name = lexer.next_str(2)?;
                 let command_success = lexer.next_u8()?;
                 if command_success != 0 {
-                    return Some(Some(APIFrame::LocalCommandResponse {
+                    Some(Some(APIFrame::LocalCommandResponse {
                         frame_id,
                         command: command_name.as_bytes().try_into().unwrap(),
                         success: command_success,
@@ -170,6 +218,8 @@ impl Iterator for Parser<'_> {
                         let signal_strength = lexer.next_u8()?;
                         let identifier_str = lexer.next_null_terminated_str()?;
                         let mut identifier = String::from(identifier_str);
+
+                        lexer.next_u16()?; // unused
 
                         let device_type = lexer.next_u8()?;
                         let status = lexer.next_u8()?;
@@ -194,10 +244,49 @@ impl Iterator for Parser<'_> {
                     _ => todo!("NYI: {}", command_name),
                 }
             }
+            0x8b => {
+                let frame_id = lexer.next_u8()?;
+                lexer.next_u16(); // reserved
+                let retries = lexer.next_u8()?;
+                let status = lexer.next_u8()?;
+                let discovery_status = lexer.next_u8()?;
+                Some(Some(APIFrame::ExtendedTransmitStatus {
+                    frame_id,
+                    retries,
+                    status,
+                    discovery_status,
+                }))
+            }
+            0x90 => {
+                let source_address = lexer.next_u64()?;
+                lexer.next_u16()?; // reserved
+                let recv_options = lexer.next_u8()?;
+                let data_len = len as usize - 12; // 12 = frame_type + src_addr + recv_options + reserved
+                let data_recv = lexer.next_bytes(data_len)?;
+                let mut payload = Vec::new();
+                payload.extend_from_slice(data_recv).unwrap();
+                Some(Some(APIFrame::ReceivePacket {
+                    source_address,
+                    recv_options,
+                    payload,
+                }))
+            }
             _ => {
                 todo!("NYI: {:x?}", &buf);
             }
+        };
+
+        lexer.next_u8()?; // checksum byte
+
+        let checksum = buf[3..4 + len as usize]
+            .iter()
+            .fold(0, |acc: u8, x| acc.wrapping_add(*x));
+        if checksum != 0xFF {
+            hprintln!("warn: checksum mismatch {}", checksum);
+            return None;
         }
+
+        result
     }
 }
 
@@ -238,28 +327,37 @@ pub enum APIFrame {
         data_length: usize,
     },
     ReceivePacket {
-        frame_id: u8,
         source_address: u64,
         recv_options: u8,
-        payload: [u8; MAX_PAYLOAD_SIZE],
-    }
+        payload: Vec<u8, MAX_PAYLOAD_SIZE>,
+    },
+    ExtendedTransmitStatus {
+        frame_id: u8,
+        retries: u8,
+        status: u8,
+        discovery_status: u8,
+    },
 }
 
-static ID_COUNTER: AtomicU8 = AtomicU8::new(0);
+static ID_COUNTER: AtomicU8 = AtomicU8::new(1);
 
 pub fn next_id() -> u8 {
-    ID_COUNTER.fetch_add(1, Ordering::SeqCst)
+    ID_COUNTER
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |x| {
+            Some(if x == 255 { 1 } else { x + 1 })
+        })
+        .unwrap()
 }
 
 static mut UNHANDLED_FRAMES: Mutex<RefCell<Vec<APIFrame, 32>>> =
     Mutex::new(RefCell::new(Vec::new()));
 
-pub fn try_claim_frame<F>(f: F) -> Option<APIFrame>
+pub fn try_claim_frame<F>(mut f: F) -> Option<APIFrame>
 where
-    F: FnOnce(&APIFrame) -> bool,
+    F: FnMut(&APIFrame) -> bool,
 {
     cortex_m::interrupt::free(|cs| {
-        let mut frames = unsafe { UNHANDLED_FRAMES.borrow(cs) }.borrow();
+        let mut frames = unsafe { UNHANDLED_FRAMES.borrow(cs) }.borrow_mut();
         for i in 0..frames.len() {
             if f(&frames[i]) {
                 let frame = frames.swap_remove(i);
@@ -268,6 +366,25 @@ where
         }
         None
     })
+}
+
+pub async fn claim_frame<F>(mut f: F) -> Option<APIFrame>
+where
+    F: FnMut(&APIFrame) -> bool,
+{
+    loop {
+        cortex_m::interrupt::free(|cs| {
+            let mut frames = unsafe { UNHANDLED_FRAMES.borrow(cs) }.borrow_mut();
+            for i in 0..frames.len() {
+                if f(&frames[i]) {
+                    let frame = frames.swap_remove(i);
+                    return Some(frame);
+                }
+            }
+            return None
+        });
+        YieldFuture::new().await;
+    }
 }
 
 impl APIFrame {
@@ -330,7 +447,8 @@ impl APIFrame {
                     .copy_from_slice(&data[..*data_length]);
                 bytes += 14 + *data_length;
             }
-            APIFrame::ReceivePacket { frame_id, source_address, recv_options, payload } => unimplemented!(),
+            APIFrame::ReceivePacket { .. } => unimplemented!(),
+            APIFrame::ExtendedTransmitStatus { .. } => unimplemented!(),
         }
 
         *buf.get_mut(1)? = (bytes - 3 >> 8) as u8;
@@ -342,34 +460,22 @@ impl APIFrame {
                 .fold(0, |acc: u8, &x| acc.wrapping_add(x));
         *buf.get_mut(bytes)? = checksum;
         bytes += 1;
-        hprintln!("{:x?}", &buf[..bytes]);
+        // hprintln!("{:x?}", &buf[..bytes]);
         Some(bytes)
     }
 
     pub async fn tx(self: &Self, buf: &mut [u8]) {
+        //hprintln!("Transmitting frame {:x?}", self);
         let bytes = self.serialize(buf).unwrap();
         crate::radio::tx(&buf[..bytes]).await;
     }
 
     pub async fn await_response(self: &Self) -> APIFrame {
-        let mut rx_buf = [0u8; RX_BUFFER_SIZE];
         loop {
-            let bytes = crate::radio::rx(&mut rx_buf).await;
-            for frame in Parser::new(&rx_buf[..bytes]) {
-                if let Some(frame) = frame {
-                    if frame.frame_id() == self.frame_id() {
-                        return frame;
-                    } else {
-                        cortex_m::interrupt::free(|cs| {
-                            unsafe { UNHANDLED_FRAMES.borrow(cs) }
-                                .borrow_mut()
-                                .push(frame);
-                        });
-                    }
-                } else {
-                    hprintln!("warn: invalid frame received");
-                }
+            if let Some(frame) = try_claim_frame(|frame| self.frame_id() == frame.frame_id()) {
+                return frame;
             }
+            YieldFuture::new().await;
         }
     }
 
@@ -378,23 +484,24 @@ impl APIFrame {
             APIFrame::LocalCommandRequest { frame_id, .. } => *frame_id,
             APIFrame::LocalCommandResponse { frame_id, .. } => *frame_id,
             APIFrame::TransmitRequest { frame_id, .. } => *frame_id,
-            APIFrame::ReceivePacket { frame_id, .. } => *frame_id,
+            APIFrame::ReceivePacket { .. } => 0, // not applicable
+            APIFrame::ExtendedTransmitStatus { frame_id, .. } => *frame_id,
         }
     }
 }
 
 pub fn setup(
-    DMA1: pac::DMA1,
+    DMA2: pac::DMA2,
     radio: hal::serial::Serial<
-        pac::USART2,
+        pac::USART1,
         (
-            gpio::Pin<'A', 2, gpio::Alternate<7>>,
-            gpio::Pin<'A', 3, gpio::Alternate<7>>,
+            gpio::Pin<'A', 15, gpio::Alternate<7>>,
+            gpio::Pin<'A', 10, gpio::Alternate<7>>,
         ),
     >,
 ) {
-    let streams = StreamsTuple::new(DMA1);
-    let tx_stream = streams.6;
+    let streams = StreamsTuple::new(DMA2);
+    let tx_stream = streams.7;
     let rx_stream = streams.5;
     let tx_buf = cortex_m::singleton!(:[u8; 32] = [0; 32]).unwrap();
     let rx_buf1 = cortex_m::singleton!(:[u8; RX_BUFFER_SIZE] = [0; RX_BUFFER_SIZE]).unwrap();
@@ -433,25 +540,25 @@ pub fn setup(
         unsafe { RX_BUFFER.borrow(cs) }.replace(Some(rx_buf2));
     });
     unsafe {
-        cortex_m::peripheral::NVIC::unmask(pac::Interrupt::DMA1_STREAM6);
-        cortex_m::peripheral::NVIC::unmask(pac::Interrupt::DMA1_STREAM5);
-        cortex_m::peripheral::NVIC::unmask(pac::Interrupt::USART2);
+        cortex_m::peripheral::NVIC::unmask(pac::Interrupt::DMA2_STREAM7);
+        cortex_m::peripheral::NVIC::unmask(pac::Interrupt::DMA2_STREAM5);
+        cortex_m::peripheral::NVIC::unmask(pac::Interrupt::USART1);
     }
 }
 
 /// Interrupt for radio DMA TX,
 #[interrupt]
-fn DMA1_STREAM6() {
+fn DMA2_STREAM7() {
     cortex_m::interrupt::free(|cs| {
         let mut transfer_ref = unsafe { TX_TRANSFER.borrow(cs) }.borrow_mut();
         let transfer = transfer_ref.as_mut().unwrap();
 
         // Its important to clear fifo errors as the transfer is paused until it is cleared
-        if Stream6::<pac::DMA1>::get_fifo_error_flag() {
+        if Stream7::<pac::DMA2>::get_fifo_error_flag() {
             transfer.clear_fifo_error_interrupt();
         }
 
-        if Stream6::<pac::DMA1>::get_transfer_complete_flag() {
+        if Stream7::<pac::DMA2>::get_transfer_complete_flag() {
             transfer.clear_transfer_complete_interrupt();
             // FIXME: A less restrictive ordering is probably possible
             TX_COMPLETE.store(true, Ordering::SeqCst);
@@ -459,18 +566,56 @@ fn DMA1_STREAM6() {
     });
 }
 
+// Call this to poll for new frames.
+pub async fn parse_recvd_data() {
+    let mut rx_buf = [0u8; RX_BUFFER_SIZE];
+    let mut bytes = crate::radio::rx(&mut rx_buf).await;
+    let mut parser = Parser::new(&rx_buf[..bytes]);
+    loop {
+        // hprintln!("Received frame {:x?}", &rx_buf[..bytes]);
+        for frame in &parser {
+            if let Some(frame) = frame {
+                hprintln!("Received frame {:x?}", frame);
+                cortex_m::interrupt::free(|cs| {
+                    let r = unsafe { UNHANDLED_FRAMES.borrow(cs) }
+                        .borrow_mut()
+                        .push(frame);
+                    match r {
+                        Ok(_) => (),
+                        Err(_) => {
+                            hprintln!("warn: unhandled frame buffer full. dropping a frame.")
+                        }
+                    }
+                });
+            } else {
+                hprintln!("warn: invalid frame received");
+            }
+        }
+
+        // Make space in buffer and try to receive more data.
+        let pos = parser.pos();
+        for i in pos..bytes {
+            rx_buf[i - pos] = rx_buf[i];
+        }
+        let unparsed_bytes = bytes - pos;
+        bytes = crate::radio::rx(&mut rx_buf[unparsed_bytes..]).await + unparsed_bytes;
+        parser = Parser::new(&rx_buf[..bytes]);
+        YieldFuture::new().await;
+    }
+}
+
 // Interrupt for radio DMA RX.
 #[interrupt]
-fn DMA1_STREAM5() {
+fn DMA2_STREAM5() {
     cortex_m::interrupt::free(|cs| {
         let mut transfer_ref = unsafe { RX_TRANSFER.borrow(cs) }.borrow_mut();
         let transfer = transfer_ref.as_mut().unwrap();
 
         // Its important to clear fifo errors as the transfer is paused until it is cleared
-        if Stream5::<pac::DMA1>::get_fifo_error_flag() {
+        if Stream5::<pac::DMA2>::get_fifo_error_flag() {
             transfer.clear_fifo_error_interrupt();
         }
-        if Stream5::<pac::DMA1>::get_transfer_complete_flag() {
+        if Stream5::<pac::DMA2>::get_transfer_complete_flag() {
             transfer.clear_transfer_complete_interrupt();
             let mut rx_buf = unsafe { RX_BUFFER.borrow(cs) }.borrow_mut().take().unwrap();
             rx_buf = transfer
@@ -479,21 +624,20 @@ fn DMA1_STREAM5() {
                 .0
                 .try_into()
                 .unwrap();
-            //hprintln!("tc: {:?}", rx_buf);
             RX_COMPLETE.store(true, Ordering::SeqCst);
-            RX_BYTES_READ.store(rx_buf.len() as u32, Ordering::SeqCst);
+            RX_BYTES_READ.store(rx_buf.len(), Ordering::SeqCst);
             unsafe { RX_BUFFER.borrow(cs) }.borrow_mut().replace(rx_buf);
         }
     });
 }
 
 #[interrupt]
-fn USART2() {
+fn USART1() {
     cortex_m::interrupt::free(|cs| {
         let mut transfer_ref = unsafe { RX_TRANSFER.borrow(cs) }.borrow_mut();
         let transfer = transfer_ref.as_mut().unwrap();
 
-        let bytes = RX_BUFFER_SIZE as u16 - Stream5::<pac::DMA1>::get_number_of_transfers();
+        let bytes = RX_BUFFER_SIZE as u16 - Stream5::<pac::DMA2>::get_number_of_transfers();
         transfer.pause(|rx| {
             rx.clear_idle_interrupt();
         });
@@ -506,9 +650,8 @@ fn USART2() {
             .0
             .try_into()
             .unwrap();
-        // hprintln!("idle: {:?} {}", rx_buf, bytes);
         RX_COMPLETE.store(true, Ordering::SeqCst);
-        RX_BYTES_READ.store(bytes as u32, Ordering::SeqCst);
+        RX_BYTES_READ.store(bytes as usize, Ordering::SeqCst);
 
         unsafe { RX_BUFFER.borrow(cs) }.borrow_mut().replace(rx_buf);
         transfer.start(|_| {});
@@ -556,12 +699,21 @@ pub async fn tx(tx_buf: &[u8]) {
 
 pub async fn rx(rx_buf: &mut [u8]) -> usize {
     radio_rx_complete().await;
-    RX_COMPLETE.store(false, Ordering::SeqCst);
     cortex_m::interrupt::free(|cs| {
         // SAFETY: not double buffered.
-        let rx_buf_ref = unsafe { RX_BUFFER.borrow(cs) }.borrow();
-        let buf = rx_buf_ref.as_ref().unwrap();
-        rx_buf[..buf.len()].copy_from_slice(*buf);
-    });
-    RX_BYTES_READ.load(Ordering::SeqCst) as usize
+        let mut buf_ref = unsafe { RX_BUFFER.borrow(cs) }.borrow_mut();
+        let buf = buf_ref.as_mut().unwrap();
+        let bytes_available = RX_BYTES_READ.load(Ordering::SeqCst) as usize;
+
+        let bytes_copied = min(rx_buf.len(), bytes_available);
+        rx_buf[..bytes_copied].copy_from_slice(&buf[..bytes_copied]);
+        RX_COMPLETE.store(bytes_available - bytes_copied != 0, Ordering::SeqCst);
+        RX_BYTES_READ.store(bytes_available - bytes_copied, Ordering::SeqCst);
+
+        for i in bytes_copied..bytes_available {
+            buf[i - bytes_copied] = buf[i]
+        }
+
+        bytes_copied
+    })
 }
