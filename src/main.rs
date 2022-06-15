@@ -7,13 +7,13 @@ use crate::futures::YieldFuture;
 use crate::hal::timer::TimerExt;
 use crate::mission::MissionState;
 use crate::usb_serial::setup_usb;
+use ::futures::join;
 use bmp388::BMP388;
 use cassette::pin_mut;
 use cassette::Cassette;
 use cortex_m::interrupt::Mutex;
 use cortex_m_semihosting::hprintln;
 use embedded_hal::digital::v2::OutputPin;
-use ::futures::join;
 use hal::adc::Adc;
 use hal::dma;
 use hal::dma::Stream0;
@@ -40,6 +40,7 @@ use cortex_m_rt::entry;
 use stm32f4xx_hal as hal;
 mod bmi055;
 mod futures;
+mod gps;
 mod mission;
 mod radio;
 mod usb_serial;
@@ -97,18 +98,6 @@ fn entry_point() -> ! {
     }
     loop {}
 }
-
-const ADC_BUF_LEN: usize = 32;
-static mut ADC_BUFFER: Mutex<RefCell<Option<&'static mut [u16; ADC_BUF_LEN]>>> =
-    Mutex::new(RefCell::new(None));
-
-static mut ADC_TRANSFER: Mutex<
-    RefCell<
-        Option<
-            Transfer<Stream0<pac::DMA2>, 0, Adc<ADC1>, dma::PeripheralToMemory, &'static mut [u16]>,
-        >,
-    >,
-> = Mutex::new(RefCell::new(None));
 
 async fn main() {
     if let (Some(mut dp), Some(mut cp)) = (
@@ -210,8 +199,8 @@ async fn main() {
         let pwm = dp.TIM2.pwm_hz(pin, 100.kHz(), &clocks).split();
 
         let timer = dp.TIM4.counter_ms(&clocks);
+        let mut i2c1 = I2c::new(dp.I2C1, (gpiob.pb6, gpiob.pb7), 100.kHz(), &clocks);
         let i2c2 = I2c::new(dp.I2C2, (gpiob.pb10, gpiob.pb9), 100.kHz(), &clocks);
-        let f1 = report_sensor_data(i2c2, timer);
         let timer = dp.TIM3.counter_ms(&clocks);
 
         let radio = dp
@@ -229,8 +218,38 @@ async fn main() {
 
         radio::setup(dp.DMA2, radio);
 
+        let gps = dp
+            .USART2
+            .serial(
+                (gpioa.pa2.into_alternate(), gpioa.pa3.into_alternate()),
+                hal::serial::config::Config {
+                    baudrate: 9600.bps(),
+                    dma: hal::serial::config::DmaConfig::TxRx,
+                    ..Default::default()
+                },
+                &clocks,
+            )
+            .unwrap();
+
+        gps::setup(dp.DMA1, gps);
+
+        let mut bmp388 = BMP388::new(i2c2).unwrap();
+        bmp388
+            .set_power_control(bmp388::PowerControl {
+                pressure_enable: true,
+                temperature_enable: true,
+                mode: bmp388::PowerMode::Normal,
+            })
+            .unwrap();
+
+        let mut bmi055 = bmi055::BMI055::new(&mut i2c1).unwrap();
+
+
+        let f2 = radio::parse_recvd_data();
+        let f3 = gps::parse_recvd_data();
+
         let mut mission = MissionState::new();
-        join!(f1, mission.start());
+        join!(f2, f3, mission.start(bmp388, timer));
     }
 }
 
@@ -314,42 +333,6 @@ fn EXTI0() {
     });
 }
 
-async fn report_sensor_data<TIM, PINS>(
-    i2c2: I2c<pac::I2C2, PINS>,
-    mut timer: CounterMs<TIM>,
-) where
-    TIM: timer::Instance,
-{
-    let mut bmp388 = BMP388::new(i2c2).unwrap();
-    hprintln!("BMP388 initialized");
-    bmp388
-        .set_power_control(bmp388::PowerControl {
-            pressure_enable: true,
-            temperature_enable: true,
-            mode: bmp388::PowerMode::Normal,
-        })
-        .unwrap();
-
-    timer.start(5000.millis()).unwrap();
-    loop {
-        bmp388
-            .sensor_values()
-            .map(|values| {
-                let alt = (1.0 / 0.0065)
-                    * (pow((values.pressure) / 101325.0, 1.0 / 5.257) - 1.0)
-                    * values.temperature;
-
-                /*hprintln!(
-                    "Temperature: {:.2}°C, Pressure: {:.2}Pa, Altitude: {:.2}m",
-                    values.temperature,
-                    values.pressure,
-                    alt
-                );*/
-            })
-            .unwrap();
-        NbFuture::new(|| timer.wait()).await.unwrap();
-    }
-}
 
 #[panic_handler]
 pub fn panic(info: &PanicInfo) -> ! {
