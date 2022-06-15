@@ -1,7 +1,7 @@
 use core::{
     cell::RefCell,
     cmp::min,
-    sync::atomic::{AtomicBool, AtomicU32, AtomicU8, AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering},
 };
 
 use cortex_m::interrupt::Mutex;
@@ -51,6 +51,18 @@ impl<'a> Lexer<'a> {
 
     pub fn next_u64(self: &mut Self) -> Option<u64> {
         let it = u64::from_be_bytes(self.data.get(self.idx..self.idx + 8)?.try_into().ok()?);
+        self.idx += 8;
+        Some(it)
+    }
+
+    pub fn next_f32(self: &mut Self) -> Option<f32> {
+        let it = f32::from_be_bytes(self.data.get(self.idx..self.idx + 4)?.try_into().ok()?);
+        self.idx += 4;
+        Some(it)
+    }
+
+    pub fn next_f64(self: &mut Self) -> Option<f64> {
+        let it = f64::from_be_bytes(self.data.get(self.idx..self.idx + 8)?.try_into().ok()?);
         self.idx += 8;
         Some(it)
     }
@@ -135,14 +147,14 @@ static mut RX_TRANSFER: Mutex<
     >,
 > = Mutex::new(RefCell::new(None));
 
-static mut RX_BUFFER: Mutex<RefCell<Option<&'static mut [u8; RX_BUFFER_SIZE]>>> =
+static mut RX_BUFFER: Mutex<RefCell<Option<&'static mut [u8; BUFFER_SIZE]>>> =
     Mutex::new(RefCell::new(None));
 
 static TX_COMPLETE: AtomicBool = AtomicBool::new(false);
 static RX_COMPLETE: AtomicBool = AtomicBool::new(false);
 static RX_BYTES_READ: AtomicUsize = AtomicUsize::new(0);
 
-const RX_BUFFER_SIZE: usize = 512;
+const BUFFER_SIZE: usize = 512;
 
 const MAX_PAYLOAD_SIZE: usize = 0x100;
 
@@ -195,6 +207,8 @@ impl<'a> Iterator for &'a Parser<'_> {
             // The full packet is not yet available
             return None;
         }
+
+        let start = lexer.pos();
 
         let result = match lexer.next_u8()? {
             0x08 => unimplemented!(),
@@ -265,10 +279,13 @@ impl<'a> Iterator for &'a Parser<'_> {
                 let data_recv = lexer.next_bytes(data_len)?;
                 let mut payload = Vec::new();
                 payload.extend_from_slice(data_recv).unwrap();
+
+                let message = Message::parse(&payload);
                 Some(Some(APIFrame::ReceivePacket {
                     source_address,
                     recv_options,
                     payload,
+                    message,
                 }))
             }
             _ => {
@@ -278,11 +295,11 @@ impl<'a> Iterator for &'a Parser<'_> {
 
         lexer.next_u8()?; // checksum byte
 
-        let checksum = buf[3..4 + len as usize]
+        let checksum = buf[start..1 + start + len as usize]
             .iter()
             .fold(0, |acc: u8, x| acc.wrapping_add(*x));
         if checksum != 0xFF {
-            hprintln!("warn: checksum mismatch {}", checksum);
+            hprintln!("warn: checksum mismatch {} {:02x?} {} {}", checksum, &buf[start..1 + start + len as usize], start, len);
             return None;
         }
 
@@ -323,13 +340,13 @@ pub enum APIFrame {
         destination_address: u64,
         broadcast_radius: u8,
         transmit_options: u8,
-        data: [u8; MAX_PAYLOAD_SIZE],
-        data_length: usize,
+        data: Vec<u8, MAX_PAYLOAD_SIZE>,
     },
     ReceivePacket {
         source_address: u64,
         recv_options: u8,
         payload: Vec<u8, MAX_PAYLOAD_SIZE>,
+        message: Option<Message>,
     },
     ExtendedTransmitStatus {
         frame_id: u8,
@@ -337,6 +354,75 @@ pub enum APIFrame {
         status: u8,
         discovery_status: u8,
     },
+}
+
+#[derive(Debug, PartialEq, Clone, Copy)]
+pub enum Message {
+    Ping(u8),
+    Pong(u8),
+    Gps { lat: f32, lon: f32, alt: f32 },
+    PressureTemp { pressure: f64, temp: f64 },
+}
+
+impl Message {
+    pub fn parse(payload: &[u8]) -> Option<Self> {
+        let mut lexer = Lexer::new(payload);
+        let message_type = lexer.next_str(4)?;
+        match message_type {
+            "PING" => {
+                let ping_id = lexer.next_u8()?;
+                Some(Message::Ping(ping_id))
+            }
+            "PONG" => {
+                let ping_id = lexer.next_u8()?;
+                Some(Message::Pong(ping_id))
+            }
+            "GPSD" => {
+                let lat = lexer.next_f32()?;
+                let lon = lexer.next_f32()?;
+                let alt = lexer.next_f32()?;
+                Some(Message::Gps { lat, lon, alt })
+            }
+            "PRTM" => {
+                let pressure = lexer.next_f64()?;
+                let temp = lexer.next_f64()?;
+                Some(Message::PressureTemp { pressure, temp })
+            }
+            _ => None,
+        }
+    }
+
+    pub fn data(&self) -> Vec<u8, MAX_PAYLOAD_SIZE> {
+        match self {
+            Message::Ping(ping_id) => {
+                let mut payload = Vec::new();
+                payload.extend_from_slice(b"PING");
+                payload.push(*ping_id);
+                payload
+            }
+            Message::Pong(ping_id) => {
+                let mut payload = Vec::new();
+                payload.extend_from_slice(b"PONG");
+                payload.push(*ping_id);
+                payload
+            }
+            Message::Gps { lat, lon, alt } => {
+                let mut payload = Vec::new();
+                payload.extend_from_slice(b"GPSD");
+                payload.extend_from_slice(&lat.to_be_bytes());
+                payload.extend_from_slice(&lon.to_be_bytes());
+                payload.extend_from_slice(&alt.to_be_bytes());
+                payload
+            }
+            Message::PressureTemp { pressure, temp } => {
+                let mut payload = Vec::new();
+                payload.extend_from_slice(b"PRTM");
+                payload.extend_from_slice(&pressure.to_be_bytes());
+                payload.extend_from_slice(&temp.to_be_bytes());
+                payload
+            }
+        }
+    }
 }
 
 static ID_COUNTER: AtomicU8 = AtomicU8::new(1);
@@ -373,7 +459,7 @@ where
     F: FnMut(&APIFrame) -> bool,
 {
     loop {
-        cortex_m::interrupt::free(|cs| {
+        if let Some(frame) = cortex_m::interrupt::free(|cs| {
             let mut frames = unsafe { UNHANDLED_FRAMES.borrow(cs) }.borrow_mut();
             for i in 0..frames.len() {
                 if f(&frames[i]) {
@@ -381,8 +467,10 @@ where
                     return Some(frame);
                 }
             }
-            return None
-        });
+            None
+        }) {
+            return Some(frame);
+        }
         YieldFuture::new().await;
     }
 }
@@ -433,7 +521,7 @@ impl APIFrame {
                 broadcast_radius,
                 transmit_options,
                 data,
-                data_length,
+                ..
             } => {
                 *buf.get_mut(bytes)? = 0x10;
                 *buf.get_mut(bytes + 1)? = *frame_id;
@@ -443,9 +531,9 @@ impl APIFrame {
                 *buf.get_mut(bytes + 11)? = 0xFE;
                 *buf.get_mut(bytes + 12)? = *broadcast_radius;
                 *buf.get_mut(bytes + 13)? = *transmit_options;
-                buf.get_mut(bytes + 14..bytes + 14 + *data_length)?
-                    .copy_from_slice(&data[..*data_length]);
-                bytes += 14 + *data_length;
+                buf.get_mut(bytes + 14..bytes + 14 + data.len())?
+                    .copy_from_slice(&data[..data.len()]);
+                bytes += 14 + data.len();
             }
             APIFrame::ReceivePacket { .. } => unimplemented!(),
             APIFrame::ExtendedTransmitStatus { .. } => unimplemented!(),
@@ -503,9 +591,9 @@ pub fn setup(
     let streams = StreamsTuple::new(DMA2);
     let tx_stream = streams.7;
     let rx_stream = streams.5;
-    let tx_buf = cortex_m::singleton!(:[u8; 32] = [0; 32]).unwrap();
-    let rx_buf1 = cortex_m::singleton!(:[u8; RX_BUFFER_SIZE] = [0; RX_BUFFER_SIZE]).unwrap();
-    let rx_buf2 = cortex_m::singleton!(:[u8; RX_BUFFER_SIZE] = [0; RX_BUFFER_SIZE]).unwrap();
+    let tx_buf = cortex_m::singleton!(:[u8; BUFFER_SIZE] = [0; BUFFER_SIZE]).unwrap();
+    let rx_buf1 = cortex_m::singleton!(:[u8; BUFFER_SIZE] = [0; BUFFER_SIZE]).unwrap();
+    let rx_buf2 = cortex_m::singleton!(:[u8; BUFFER_SIZE] = [0; BUFFER_SIZE]).unwrap();
     let (tx, mut rx) = radio.split();
     let mut tx_transfer = Transfer::init_memory_to_peripheral(
         tx_stream,
@@ -568,7 +656,7 @@ fn DMA2_STREAM7() {
 
 // Call this to poll for new frames.
 pub async fn parse_recvd_data() {
-    let mut rx_buf = [0u8; RX_BUFFER_SIZE];
+    let mut rx_buf = [0u8; BUFFER_SIZE];
     let mut bytes = crate::radio::rx(&mut rx_buf).await;
     let mut parser = Parser::new(&rx_buf[..bytes]);
     loop {
@@ -637,7 +725,7 @@ fn USART1() {
         let mut transfer_ref = unsafe { RX_TRANSFER.borrow(cs) }.borrow_mut();
         let transfer = transfer_ref.as_mut().unwrap();
 
-        let bytes = RX_BUFFER_SIZE as u16 - Stream5::<pac::DMA2>::get_number_of_transfers();
+        let bytes = BUFFER_SIZE as u16 - Stream5::<pac::DMA2>::get_number_of_transfers();
         transfer.pause(|rx| {
             rx.clear_idle_interrupt();
         });

@@ -22,9 +22,9 @@ static mut USB_BUS: Option<UsbBusAllocator<UsbBus<USB>>> = None;
 static mut EP_MEMORY: [u32; 1024] = [0; 1024];
 
 /// Get a reference to the serial port.
-pub fn get_serial() -> &'static Serial<'static> {
+pub fn get_serial() -> &'static mut Serial<'static> {
     // SAFETY: SERIAL is only mutated once at initialization.
-    unsafe { SERIAL.as_ref().unwrap() }
+    unsafe { SERIAL.as_mut().unwrap() }
 }
 
 /// Try to get a reference to the serial port
@@ -107,6 +107,20 @@ impl<'a> Serial<'a> {
             let mut usb_dev = self.usb_device.borrow(cs).borrow_mut();
             usb_dev.poll(&mut [&mut *serial_port])
         })
+    }
+}
+
+impl core::fmt::Write for Serial<'_> {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        let future = self.write(s.as_bytes());
+        cassette::pin_mut!(future);
+        let mut cm = cassette::Cassette::new(future);
+        loop {
+            if let Some(_) = cm.poll_on() {
+                break;
+            }
+        }
+        Ok(())
     }
 }
 
