@@ -7,6 +7,7 @@ use crate::futures::YieldFuture;
 use crate::hal::timer::TimerExt;
 use crate::mission::MissionState;
 use crate::usb_serial::setup_usb;
+use cortex_m_semihosting::hprint;
 use ::futures::join;
 use bmp388::BMP388;
 use cassette::pin_mut;
@@ -23,6 +24,9 @@ use hal::gpio::Input;
 use hal::i2c::I2c;
 use hal::interrupt;
 use hal::pac::ADC1;
+use hal::sdio::ClockFreq;
+use hal::sdio::SdCard;
+use hal::sdio::Sdio;
 use hal::timer;
 use hal::timer::CounterMs;
 use libm::pow;
@@ -136,15 +140,12 @@ async fn main() {
             &clocks,
         );
 
-        /* let mut delay = cp.SYST.delay(&clocks);
+        let mut delay = cp.SYST.delay(&clocks);
 
         let d0 = gpiob.pb4.into_alternate().internal_pull_up(true);
-        let d1 = gpioa.pa8.into_alternate().internal_pull_up(true);
-        let d2 = gpioa.pa9.into_alternate().internal_pull_up(true);
-        let d3 = gpiob.pb5.into_alternate().internal_pull_up(true);
         let clk = gpiob.pb15.into_alternate().internal_pull_up(false);
         let cmd = gpioa.pa6.into_alternate().internal_pull_up(true);
-        let mut sdio: Sdio<SdCard> = Sdio::new(dp.SDIO, (clk, cmd, d0, d1, d2, d3), &clocks);
+        let mut sdio: Sdio<SdCard> = Sdio::new(dp.SDIO, (clk, cmd, d0), &clocks);
 
         hprintln!("Waiting for card...");
 
@@ -173,7 +174,7 @@ async fn main() {
 
         for b in block.iter() {
             hprint!("{:X} ", b);
-        } */
+        } 
 
         let mut syscfg = dp.SYSCFG.constrain();
         let mut button = gpioa.pa0.into_pull_up_input();
