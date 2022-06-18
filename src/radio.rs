@@ -1,7 +1,7 @@
 use core::{
     cell::RefCell,
     cmp::min,
-    sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering}, borrow::Borrow,
 };
 
 use cortex_m::interrupt::Mutex;
@@ -20,8 +20,9 @@ use stm32f4xx_hal::{
     interrupt, pac,
     serial::{Rx, Tx},
 };
+use time::macros::offset;
 
-use crate::futures::YieldFuture;
+use crate::{futures::YieldFuture, sdcard::get_logger, get_timestamp};
 use stm32f4xx_hal as hal;
 
 pub struct Lexer<'a> {
@@ -63,6 +64,12 @@ impl<'a> Lexer<'a> {
 
     pub fn next_f64(self: &mut Self) -> Option<f64> {
         let it = f64::from_be_bytes(self.data.get(self.idx..self.idx + 8)?.try_into().ok()?);
+        self.idx += 8;
+        Some(it)
+    }
+
+    pub fn next_i64(self: &mut Self) -> Option<i64> {
+        let it = i64::from_be_bytes(self.data.get(self.idx..self.idx + 8)?.try_into().ok()?);
         self.idx += 8;
         Some(it)
     }
@@ -360,8 +367,10 @@ pub enum APIFrame {
 pub enum Message {
     Ping(u8),
     Pong(u8),
-    Gps { lat: f32, lon: f32, alt: f32 },
+    Gps { lat: f64, lon: f64, alt: f64 },
     PressureTemp { pressure: f64, temp: f64 },
+    ReadyForAscent,
+    SetLaunchT(i64),
 }
 
 impl Message {
@@ -378,15 +387,20 @@ impl Message {
                 Some(Message::Pong(ping_id))
             }
             "GPSD" => {
-                let lat = lexer.next_f32()?;
-                let lon = lexer.next_f32()?;
-                let alt = lexer.next_f32()?;
+                let lat = lexer.next_f64()?;
+                let lon = lexer.next_f64()?;
+                let alt = lexer.next_f64()?;
                 Some(Message::Gps { lat, lon, alt })
             }
             "PRTM" => {
                 let pressure = lexer.next_f64()?;
                 let temp = lexer.next_f64()?;
                 Some(Message::PressureTemp { pressure, temp })
+            }
+            "RDYA" => Some(Message::ReadyForAscent),
+            "SETT" => {
+                let t = lexer.next_i64()?;
+                Some(Message::SetLaunchT(t))
             }
             _ => None,
         }
@@ -421,6 +435,17 @@ impl Message {
                 payload.extend_from_slice(&temp.to_be_bytes());
                 payload
             }
+            Message::ReadyForAscent => {
+                let mut payload = Vec::new();
+                payload.extend_from_slice(b"RDYA");
+                payload
+            }
+            Message::SetLaunchT(t) => {
+                let mut payload = Vec::new();
+                payload.extend_from_slice(b"SETT");
+                payload.extend_from_slice(&t.to_be_bytes());
+                payload
+            },
         }
     }
 }
@@ -567,6 +592,19 @@ impl APIFrame {
         }
     }
 
+    pub async fn await_response_timeout(self: &Self, timeout_secs: i64) -> Option<APIFrame> {
+        let start_time = get_timestamp();
+        loop {
+            if let Some(frame) = try_claim_frame(|frame| self.frame_id() == frame.frame_id()) {
+                return Some(frame);
+            }
+            if get_timestamp() - start_time > timeout_secs {
+                return None;
+            }
+            YieldFuture::new().await;
+        }
+    }
+
     pub fn frame_id(self: &Self) -> u8 {
         match self {
             APIFrame::LocalCommandRequest { frame_id, .. } => *frame_id,
@@ -663,7 +701,7 @@ pub async fn parse_recvd_data() {
         // hprintln!("Received frame {:x?}", &rx_buf[..bytes]);
         for frame in &parser {
             if let Some(frame) = frame {
-                hprintln!("Received frame {:x?}", frame);
+                //get_logger().log(format_args!("Received frame {:x?}", frame));
                 cortex_m::interrupt::free(|cs| {
                     let r = unsafe { UNHANDLED_FRAMES.borrow(cs) }
                         .borrow_mut()

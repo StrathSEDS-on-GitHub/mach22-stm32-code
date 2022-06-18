@@ -6,14 +6,22 @@ use crate::futures::NbFuture;
 use crate::futures::YieldFuture;
 use crate::hal::timer::TimerExt;
 use crate::mission::MissionState;
+use crate::sdcard::SdLogger;
+use crate::sdcard::get_logger;
 use crate::usb_serial::setup_usb;
 use ::futures::join;
 use bmp388::BMP388;
 use cassette::pin_mut;
 use cassette::Cassette;
 use cortex_m::interrupt::Mutex;
+use cortex_m_semihosting::hprint;
 use cortex_m_semihosting::hprintln;
 use embedded_hal::digital::v2::OutputPin;
+use embedded_sdmmc::Block;
+use embedded_sdmmc::BlockDevice;
+use embedded_sdmmc::BlockIdx;
+use embedded_sdmmc::Mode;
+use embedded_sdmmc::VolumeIdx;
 use hal::adc::Adc;
 use hal::dma;
 use hal::dma::Stream0;
@@ -23,6 +31,11 @@ use hal::gpio::Input;
 use hal::i2c::I2c;
 use hal::interrupt;
 use hal::pac::ADC1;
+use hal::rtc::Rtc;
+use hal::sdio::ClockFreq;
+use hal::sdio::SdCard;
+use hal::sdio::Sdio;
+use hal::sdio::SdioPeripheral;
 use hal::timer;
 use hal::timer::CounterMs;
 use libm::pow;
@@ -43,6 +56,7 @@ mod futures;
 mod gps;
 mod mission;
 mod radio;
+mod sdcard;
 mod usb_serial;
 
 const TEMPO: i32 = 114;
@@ -85,6 +99,15 @@ static mut USER_BUTTON: Mutex<RefCell<Option<gpio::Pin<'A', 0, Input>>>> =
     Mutex::new(RefCell::new(None));
 
 static mut SHOULD_RICKROLL: Mutex<RefCell<bool>> = Mutex::new(RefCell::new(false));
+
+static mut RTC: Mutex<RefCell<Option<Rtc>>> = Mutex::new(RefCell::new(None));
+
+fn get_timestamp() -> i64 {
+    cortex_m::interrupt::free(|cs| {
+        let mut rtc_ref = unsafe { crate::RTC.borrow(cs) }.borrow_mut();
+        rtc_ref.as_mut().unwrap().get_datetime().assume_utc().unix_timestamp()
+    })
+}
 
 #[entry]
 fn entry_point() -> ! {
@@ -136,47 +159,40 @@ async fn main() {
             &clocks,
         );
 
-        /* let mut delay = cp.SYST.delay(&clocks);
+        let mut delay = cp.SYST.delay(&clocks);
 
-        let d0 = gpiob.pb4.into_alternate().internal_pull_up(true);
-        let d1 = gpioa.pa8.into_alternate().internal_pull_up(true);
-        let d2 = gpioa.pa9.into_alternate().internal_pull_up(true);
-        let d3 = gpiob.pb5.into_alternate().internal_pull_up(true);
-        let clk = gpiob.pb15.into_alternate().internal_pull_up(false);
-        let cmd = gpioa.pa6.into_alternate().internal_pull_up(true);
-        let mut sdio: Sdio<SdCard> = Sdio::new(dp.SDIO, (clk, cmd, d0, d1, d2, d3), &clocks);
+        if !matches!(mission::NODE_TYPE, mission::NodeType::GroundStation(_)) {
+            let d0 = gpiob.pb4.into_alternate().internal_pull_up(true);
+            let clk = gpiob.pb15.into_alternate().internal_pull_up(false);
+            let cmd = gpioa.pa6.into_alternate().internal_pull_up(true);
+            let mut sdio: Sdio<SdCard> = Sdio::new(dp.SDIO, (clk, cmd, d0), &clocks);
 
-        hprintln!("Waiting for card...");
+            hprintln!("Waiting for card...");
 
-        // Wait for card to be ready
-        loop {
-            match sdio.init(ClockFreq::F24Mhz) {
-                Ok(_) => break,
-                Err(_err) => (),
+            // Wait for card to be ready
+            loop {
+                match sdio.init(ClockFreq::F1Mhz) {
+                    Ok(_) => break,
+                    Err(_err) => (hprint!("_err {:?}\n", _err)),
+                }
+
+                delay.delay_ms(1000u32);
             }
 
-            delay.delay_ms(1000u32);
+            let nblocks = sdio.card().map(|c| c.block_count()).unwrap_or(0);
+            hprintln!("Card detected: nbr of blocks: {:?}", nblocks);
+
+            SdLogger::new(sdio).expect("Failed to create SD logger");
         }
-
-        let nblocks = sdio.card().map(|c| c.block_count()).unwrap_or(0);
-        hprintln!("Card detected: nbr of blocks: {:?}", nblocks);
-
-        // Read a block from the card and print the data
-        let mut block = [0u8; 512];
-
-        match sdio.read_block(0, &mut block) {
-            Ok(()) => (),
-            Err(err) => {
-                hprintln!("Failed to read block: {:?}", err);
-            }
-        }
-
-        for b in block.iter() {
-            hprint!("{:X} ", b);
-        } */
+        let rtc = Rtc::new(dp.RTC, &mut dp.PWR);
+        cortex_m::interrupt::free(|cs| {
+            // SAFETY: Mutex makes access of static mutable variable safe
+            unsafe { RTC.borrow(cs).replace(Some(rtc)) }
+        });
 
         let mut syscfg = dp.SYSCFG.constrain();
         let mut button = gpioa.pa0.into_pull_up_input();
+
         button.make_interrupt_source(&mut syscfg);
         button.enable_interrupt(&mut dp.EXTI);
         button.trigger_on_edge(&mut dp.EXTI, Edge::RisingFalling);
@@ -199,7 +215,7 @@ async fn main() {
         let pwm = dp.TIM2.pwm_hz(pin, 100.kHz(), &clocks).split();
 
         let timer = dp.TIM4.counter_ms(&clocks);
-        let mut i2c1 = I2c::new(dp.I2C1, (gpiob.pb6, gpiob.pb7), 100.kHz(), &clocks);
+        // let mut i2c1 = I2c::new(dp.I2C1, (gpiob.pb6, gpiob.pb7), 100.kHz(), &clocks);
         let i2c2 = I2c::new(dp.I2C2, (gpiob.pb10, gpiob.pb9), 100.kHz(), &clocks);
         let timer = dp.TIM3.counter_ms(&clocks);
 
@@ -241,9 +257,6 @@ async fn main() {
                 mode: bmp388::PowerMode::Normal,
             })
             .unwrap();
-
-        let mut bmi055 = bmi055::BMI055::new(&mut i2c1).unwrap();
-
 
         let f2 = radio::parse_recvd_data();
         let f3 = gps::parse_recvd_data();
@@ -333,7 +346,6 @@ fn EXTI0() {
     });
 }
 
-
 #[panic_handler]
 pub fn panic(info: &PanicInfo) -> ! {
     cortex_m::interrupt::free(|cs| {
@@ -344,5 +356,6 @@ pub fn panic(info: &PanicInfo) -> ! {
         }
     });
     hprintln!("Panic! {}", info);
+    get_logger().log(format_args!("Panic! {}", info));
     loop {}
 }

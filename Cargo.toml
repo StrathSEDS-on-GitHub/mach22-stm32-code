@@ -22,6 +22,7 @@ usbd-serial = "0.1.0"
 heapless = "0.7.13"
 nmea0183 = "0.3.0"
 phf = { version = "0.10", default-features = false, features=["macros"] }
+embedded-sdmmc="0.3.0"
 
 [dependencies.stm32f4xx-hal]
 version = "0.13.2"

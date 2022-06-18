@@ -10,7 +10,8 @@ use hal::{
     dma::{Stream6, StreamsTuple},
     gpio,
 };
-use heapless::{String, Vec};
+use heapless::{Deque, String, Vec};
+use nmea0183::ParseResult;
 use stm32f4xx_hal::{
     dma::{
         self,
@@ -21,7 +22,7 @@ use stm32f4xx_hal::{
     serial::{Rx, Tx},
 };
 
-use crate::futures::YieldFuture;
+use crate::{futures::YieldFuture, sdcard::{SdLogger, get_logger}};
 use stm32f4xx_hal as hal;
 
 static mut TX_TRANSFER: Mutex<
@@ -62,7 +63,7 @@ static RX_BYTES_READ: AtomicUsize = AtomicUsize::new(0);
 const RX_BUFFER_SIZE: usize = 512;
 pub fn setup(
     dma1: pac::DMA1,
-    radio: hal::serial::Serial<
+    gps: hal::serial::Serial<
         pac::USART2,
         (
             gpio::Pin<'A', 2, gpio::Alternate<7>>,
@@ -76,7 +77,7 @@ pub fn setup(
     let tx_buf = cortex_m::singleton!(:[u8; 32] = [0; 32]).unwrap();
     let rx_buf1 = cortex_m::singleton!(:[u8; RX_BUFFER_SIZE] = [0; RX_BUFFER_SIZE]).unwrap();
     let rx_buf2 = cortex_m::singleton!(:[u8; RX_BUFFER_SIZE] = [0; RX_BUFFER_SIZE]).unwrap();
-    let (tx, mut rx) = radio.split();
+    let (tx, mut rx) = gps.split();
     let mut tx_transfer = Transfer::init_memory_to_peripheral(
         tx_stream,
         tx,
@@ -108,11 +109,32 @@ pub fn setup(
         unsafe { TX_TRANSFER.borrow(cs) }.replace(Some(tx_transfer));
         unsafe { RX_TRANSFER.borrow(cs) }.replace(Some(rx_transfer));
         unsafe { RX_BUFFER.borrow(cs) }.replace(Some(rx_buf2));
+
+        unsafe { GPS_SENTENCE_BUFFER.borrow(cs) }.replace(Some(Deque::new()))
     });
     unsafe {
         cortex_m::peripheral::NVIC::unmask(pac::Interrupt::DMA1_STREAM6);
         cortex_m::peripheral::NVIC::unmask(pac::Interrupt::DMA1_STREAM5);
         cortex_m::peripheral::NVIC::unmask(pac::Interrupt::USART2);
+    }
+}
+
+static mut GPS_SENTENCE_BUFFER: Mutex<RefCell<Option<Deque<ParseResult, 64>>>> =
+    Mutex::new(RefCell::new(None));
+
+pub async fn next_sentence() -> ParseResult {
+    loop {
+        if let Some(x) = cortex_m::interrupt::free(|cs| {
+            unsafe { GPS_SENTENCE_BUFFER.borrow(cs) }
+                .borrow_mut()
+                .as_mut()
+                .unwrap()
+                .pop_front()
+        }) {
+            return x;
+        }
+
+        YieldFuture::new().await;
     }
 }
 
@@ -144,7 +166,19 @@ pub async fn parse_recvd_data() {
 
     loop {
         for parse_result in parser.parse_from_bytes(&rx_buf[..bytes]) {
-            hprintln!("{:?}", parse_result);
+            if let Ok(parse_result) = parse_result {
+                cortex_m::interrupt::free(|cs| {
+                    let failed = unsafe { GPS_SENTENCE_BUFFER.borrow(cs) }
+                        .borrow_mut()
+                        .as_mut()
+                        .unwrap()
+                        .push_back(parse_result)
+                        .is_err();
+                    if failed {
+                        get_logger().log_str("warn: GPS buffer full. packet discarded.");
+                    }
+                });
+            }
         }
         bytes = crate::gps::rx(&mut rx_buf).await;
     }
@@ -204,7 +238,7 @@ fn USART2() {
     });
 }
 
-async fn radio_tx_complete() {
+async fn gps_tx_complete() {
     loop {
         if TX_COMPLETE.load(Ordering::SeqCst) {
             break;
@@ -214,7 +248,7 @@ async fn radio_tx_complete() {
     }
 }
 
-async fn radio_rx_complete() {
+async fn gps_rx_complete() {
     loop {
         if RX_COMPLETE.load(Ordering::SeqCst) {
             break;
@@ -225,7 +259,7 @@ async fn radio_rx_complete() {
 }
 
 pub async fn tx(tx_buf: &[u8]) {
-    radio_tx_complete().await;
+    gps_tx_complete().await;
     cortex_m::interrupt::free(|cs| {
         let mut tx_transfer_ref = unsafe { TX_TRANSFER.borrow(cs) }.borrow_mut();
         let tx_transfer = tx_transfer_ref.as_mut().unwrap();
@@ -240,11 +274,11 @@ pub async fn tx(tx_buf: &[u8]) {
                 .unwrap();
         }
     });
-    radio_tx_complete().await;
+    gps_tx_complete().await;
 }
 
 pub async fn rx(rx_buf: &mut [u8]) -> usize {
-    radio_rx_complete().await;
+    gps_rx_complete().await;
     cortex_m::interrupt::free(|cs| {
         // SAFETY: not double buffered.
         let mut buf_ref = unsafe { RX_BUFFER.borrow(cs) }.borrow_mut();
