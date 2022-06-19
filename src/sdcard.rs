@@ -2,17 +2,17 @@ use core::cell::RefCell;
 use core::fmt::{self, Write};
 
 use cortex_m::interrupt::Mutex;
-use cortex_m_semihosting::hprint;
+use cortex_m_semihosting::{hprint, hprintln};
 use embedded_sdmmc::{Block, BlockDevice, BlockIdx, Controller, File, Mode, Volume, VolumeIdx};
 use hal::rtc::Rtc;
 use stm32f4xx_hal::sdio::{SdCard, Sdio};
 
 use stm32f4xx_hal as hal;
 
-use crate::RTC;
 use crate::usb_serial::get_serial;
+use crate::RTC;
 
-static mut LOGGER: Option<Logger> = Some(Logger { sd_logger: None});
+static mut LOGGER: Option<Logger> = Some(Logger { sd_logger: None });
 
 pub fn get_logger() -> &'static mut Logger {
     unsafe { LOGGER.as_mut().unwrap() }
@@ -127,20 +127,25 @@ impl SdLogger {
                 .as_hms_milli()
         });
         write!(buf, "{:02}:{:02}:{:02}.{:03}: ", h, m, s, milli).unwrap();
-        self.cont
-            .write(&mut self.vol, &mut self.file, buf.0)
-            .unwrap();
-        self.cont
-            .write(&mut self.vol, &mut self.file, msg.as_bytes())
-            .unwrap();
-        self.cont
-            .write(&mut self.vol, &mut self.file, b"\n")
-            .unwrap();
+        loop {
+            if self
+                .cont
+                .write(&mut self.vol, &mut self.file, buf.0)
+                .and_then(|_| {
+                    self.cont
+                        .write(&mut self.vol, &mut self.file, msg.as_bytes())
+                        .and_then(|_| self.cont.write(&mut self.vol, &mut self.file, b"\n"))
+                })
+                .is_ok()
+            {
+                break;
+            }
+        }
     }
 }
 
 pub struct Logger {
-    sd_logger: Option<SdLogger>
+    sd_logger: Option<SdLogger>,
 }
 
 impl Logger {
@@ -148,7 +153,9 @@ impl Logger {
         match &mut self.sd_logger {
             Some(sd_logger) => sd_logger.log(fmt),
             None => {
-                get_serial().write_fmt(format_args!("logs,{}\n", fmt)).unwrap();
+                get_serial()
+                    .write_fmt(format_args!("logs,{}\n", fmt))
+                    .unwrap();
             }
         }
     }
@@ -157,7 +164,9 @@ impl Logger {
         match &mut self.sd_logger {
             Some(sd_logger) => sd_logger.log_str(msg),
             None => {
-                get_serial().write_fmt(format_args!("logs,{}\n", msg)).unwrap();
+                get_serial()
+                    .write_fmt(format_args!("logs,{}\n", msg))
+                    .unwrap();
             }
         }
     }

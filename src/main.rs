@@ -6,8 +6,8 @@ use crate::futures::NbFuture;
 use crate::futures::YieldFuture;
 use crate::hal::timer::TimerExt;
 use crate::mission::MissionState;
-use crate::sdcard::SdLogger;
 use crate::sdcard::get_logger;
+use crate::sdcard::SdLogger;
 use crate::usb_serial::setup_usb;
 use ::futures::join;
 use bmp388::BMP388;
@@ -31,6 +31,7 @@ use hal::gpio::Input;
 use hal::i2c::I2c;
 use hal::interrupt;
 use hal::pac::ADC1;
+use hal::rcc::Clocks;
 use hal::rtc::Rtc;
 use hal::sdio::ClockFreq;
 use hal::sdio::SdCard;
@@ -105,7 +106,12 @@ static mut RTC: Mutex<RefCell<Option<Rtc>>> = Mutex::new(RefCell::new(None));
 fn get_timestamp() -> i64 {
     cortex_m::interrupt::free(|cs| {
         let mut rtc_ref = unsafe { crate::RTC.borrow(cs) }.borrow_mut();
-        rtc_ref.as_mut().unwrap().get_datetime().assume_utc().unix_timestamp()
+        rtc_ref
+            .as_mut()
+            .unwrap()
+            .get_datetime()
+            .assume_utc()
+            .unix_timestamp()
     })
 }
 
@@ -121,6 +127,7 @@ fn entry_point() -> ! {
     }
     loop {}
 }
+static mut CLOCKS: Mutex<RefCell<Option<Clocks>>> = Mutex::new(RefCell::new(None));
 
 async fn main() {
     if let (Some(mut dp), Some(mut cp)) = (
@@ -171,7 +178,7 @@ async fn main() {
 
             // Wait for card to be ready
             loop {
-                match sdio.init(ClockFreq::F1Mhz) {
+                match sdio.init(ClockFreq::F400Khz) {
                     Ok(_) => break,
                     Err(_err) => (hprint!("_err {:?}\n", _err)),
                 }
@@ -249,6 +256,13 @@ async fn main() {
 
         gps::setup(dp.DMA1, gps);
 
+        //hprintln!("hello?????");
+        //hprintln!("GPS Changed baudrate");
+        cortex_m::interrupt::free(|cs| {
+            // SAFETY: Mutex makes access of static mutable variable safe
+            unsafe { CLOCKS.borrow(cs) }.replace(Some(clocks));
+        });
+
         let mut bmp388 = BMP388::new(i2c2).unwrap();
         bmp388
             .set_power_control(bmp388::PowerControl {
@@ -257,6 +271,7 @@ async fn main() {
                 mode: bmp388::PowerMode::Normal,
             })
             .unwrap();
+
 
         let f2 = radio::parse_recvd_data();
         let f3 = gps::parse_recvd_data();

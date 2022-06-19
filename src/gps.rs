@@ -1,14 +1,19 @@
 use core::{
     cell::RefCell,
     cmp::min,
+    marker::PhantomData,
+    pin::Pin,
     sync::atomic::{AtomicBool, AtomicU32, AtomicU8, AtomicUsize, Ordering},
 };
 
 use cortex_m::interrupt::Mutex;
-use cortex_m_semihosting::hprintln;
+use cortex_m_semihosting::{hprint, hprintln};
 use hal::{
     dma::{Stream6, StreamsTuple},
-    gpio,
+    gpio::{self, gpioa, Alternate, GpioExt, Input, Output},
+    pac::{Peripherals, USART2},
+    prelude::_stm32f4xx_hal_time_U32Ext,
+    serial::{Serial, SerialExt},
 };
 use heapless::{Deque, String, Vec};
 use nmea0183::ParseResult;
@@ -22,7 +27,10 @@ use stm32f4xx_hal::{
     serial::{Rx, Tx},
 };
 
-use crate::{futures::YieldFuture, sdcard::{SdLogger, get_logger}};
+use crate::{
+    futures::YieldFuture,
+    sdcard::{get_logger, SdLogger},
+};
 use stm32f4xx_hal as hal;
 
 static mut TX_TRANSFER: Mutex<
@@ -60,6 +68,14 @@ static TX_COMPLETE: AtomicBool = AtomicBool::new(false);
 static RX_COMPLETE: AtomicBool = AtomicBool::new(false);
 static RX_BYTES_READ: AtomicUsize = AtomicUsize::new(0);
 
+struct FakeUSART2 {
+    _marker: PhantomData<*const ()>,
+}
+
+struct FakePin<const P: char, const N: u8, MODE = gpio::Input> {
+    _mode: PhantomData<MODE>,
+}
+
 const RX_BUFFER_SIZE: usize = 512;
 pub fn setup(
     dma1: pac::DMA1,
@@ -74,14 +90,14 @@ pub fn setup(
     let streams = StreamsTuple::new(dma1);
     let tx_stream = streams.6;
     let rx_stream = streams.5;
-    let tx_buf = cortex_m::singleton!(:[u8; 32] = [0; 32]).unwrap();
-    let rx_buf1 = cortex_m::singleton!(:[u8; RX_BUFFER_SIZE] = [0; RX_BUFFER_SIZE]).unwrap();
-    let rx_buf2 = cortex_m::singleton!(:[u8; RX_BUFFER_SIZE] = [0; RX_BUFFER_SIZE]).unwrap();
+    let tx_buf_gps = cortex_m::singleton!(:[u8; 32] = [0; 32]).unwrap();
+    let rx_buf1_gps = cortex_m::singleton!(:[u8; RX_BUFFER_SIZE] = [0; RX_BUFFER_SIZE]).unwrap();
+    let rx_buf2_gps = cortex_m::singleton!(:[u8; RX_BUFFER_SIZE] = [0; RX_BUFFER_SIZE]).unwrap();
     let (tx, mut rx) = gps.split();
     let mut tx_transfer = Transfer::init_memory_to_peripheral(
         tx_stream,
         tx,
-        tx_buf as &mut [u8],
+        tx_buf_gps as &mut [u8],
         None,
         dma::config::DmaConfig::default()
             .memory_increment(true)
@@ -92,7 +108,7 @@ pub fn setup(
     let mut rx_transfer = Transfer::init_peripheral_to_memory(
         rx_stream,
         rx,
-        rx_buf1 as &mut [u8],
+        rx_buf1_gps as &mut [u8],
         None,
         dma::config::DmaConfig::default()
             .memory_increment(true)
@@ -108,7 +124,7 @@ pub fn setup(
         // SAFETY: Mutex makes access of static mutable variable safe
         unsafe { TX_TRANSFER.borrow(cs) }.replace(Some(tx_transfer));
         unsafe { RX_TRANSFER.borrow(cs) }.replace(Some(rx_transfer));
-        unsafe { RX_BUFFER.borrow(cs) }.replace(Some(rx_buf2));
+        unsafe { RX_BUFFER.borrow(cs) }.replace(Some(rx_buf2_gps));
 
         unsafe { GPS_SENTENCE_BUFFER.borrow(cs) }.replace(Some(Deque::new()))
     });
@@ -117,6 +133,87 @@ pub fn setup(
         cortex_m::peripheral::NVIC::unmask(pac::Interrupt::DMA1_STREAM5);
         cortex_m::peripheral::NVIC::unmask(pac::Interrupt::USART2);
     }
+}
+
+pub async fn change_baudrate(baudrate: u32) {
+    //gps_tx_complete().await;
+    cortex_m::interrupt::free(|cs| {
+        // SAFETY: Mutex makes access of static mutable variable safe
+        let tx_transfer = unsafe { TX_TRANSFER.borrow(cs) }.replace(None).unwrap();
+        let rx_transfer = unsafe { RX_TRANSFER.borrow(cs) }.replace(None).unwrap();
+
+        let (rx_stream, rx, rx_buf, _) = rx_transfer.release();
+        let (tx_stream, tx, tx_buf, _) = tx_transfer.release();
+
+        let serial = {
+            // Seemingly there's no way to simply rejoin the Tx and Rx and then release so we need to get our hands dirty...
+            let mut clocks_ref = unsafe { crate::CLOCKS.borrow(cs) }.borrow_mut();
+            let clocks = clocks_ref.as_mut().unwrap();
+
+            // FIXME: Holy shit what the fuck is this code
+            let usart2: USART2 = unsafe {
+                core::mem::transmute(FakeUSART2 {
+                    _marker: PhantomData,
+                })
+            };
+            let pa2: gpio::Pin<'A', 2, Input> = unsafe {
+                core::mem::transmute::<FakePin<'A', 2, Input>, gpio::Pin<'A', 2, Input>>(FakePin {
+                    _mode: PhantomData::<gpio::Input>,
+                })
+            };
+
+            let pa3: gpio::Pin<'A', 3, Input> = unsafe {
+                core::mem::transmute::<FakePin<'A', 3, Input>, gpio::Pin<'A', 3, Input>>(FakePin {
+                    _mode: PhantomData::<gpio::Input>,
+                })
+            };
+            usart2
+                .serial(
+                    (pa2.into_alternate(), pa3.into_alternate()),
+                    hal::serial::config::Config {
+                        baudrate: baudrate.bps(),
+                        dma: hal::serial::config::DmaConfig::TxRx,
+                        ..Default::default()
+                    },
+                    clocks,
+                )
+                .unwrap()
+        };
+        let (tx, mut rx) = serial.split();
+        rx.listen_idle();
+        let mut tx_transfer = Transfer::init_memory_to_peripheral(
+            tx_stream,
+            tx,
+            tx_buf as &mut [u8],
+            None,
+            dma::config::DmaConfig::default()
+                .memory_increment(true)
+                .fifo_enable(true)
+                .transfer_complete_interrupt(true),
+        );
+        rx.listen_idle();
+        let mut rx_transfer = Transfer::init_peripheral_to_memory(
+            rx_stream,
+            rx,
+            rx_buf as &mut [u8],
+            None,
+            dma::config::DmaConfig::default()
+                .memory_increment(true)
+                .fifo_enable(true)
+                .fifo_error_interrupt(true)
+                .transfer_error_interrupt(true)
+                .direct_mode_error_interrupt(true)
+                .transfer_complete_interrupt(true),
+        );
+        rx_transfer.start(|_rx| {});
+        tx_transfer.start(|_tx| {});
+
+        RX_COMPLETE.store(false, Ordering::SeqCst);
+        RX_BYTES_READ.store(0, Ordering::SeqCst);
+        // SAFETY: Mutex makes access of static mutable variable safe
+        unsafe { TX_TRANSFER.borrow(cs) }.replace(Some(tx_transfer));
+        unsafe { RX_TRANSFER.borrow(cs) }.replace(Some(rx_transfer));
+    });
 }
 
 static mut GPS_SENTENCE_BUFFER: Mutex<RefCell<Option<Deque<ParseResult, 64>>>> =
@@ -165,6 +262,11 @@ pub async fn parse_recvd_data() {
     let mut parser = nmea0183::Parser::new();
 
     loop {
+        /*get_logger().log(format_args!(
+            "{}",
+            core::str::from_utf8(&rx_buf[..bytes])
+        )); */
+        // hprintln!("{:?}", core::str::from_utf8(&rx_buf[..bytes]));
         for parse_result in parser.parse_from_bytes(&rx_buf[..bytes]) {
             if let Ok(parse_result) = parse_result {
                 cortex_m::interrupt::free(|cs| {

@@ -1,7 +1,8 @@
 use core::{
-    cell::RefCell,
+    borrow::Borrow,
+    cell::{BorrowMutError, RefCell},
     cmp::min,
-    sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering}, borrow::Borrow,
+    sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering},
 };
 
 use cortex_m::interrupt::Mutex;
@@ -22,7 +23,7 @@ use stm32f4xx_hal::{
 };
 use time::macros::offset;
 
-use crate::{futures::YieldFuture, sdcard::get_logger, get_timestamp};
+use crate::{futures::YieldFuture, get_timestamp, mission, sdcard::get_logger};
 use stm32f4xx_hal as hal;
 
 pub struct Lexer<'a> {
@@ -306,7 +307,13 @@ impl<'a> Iterator for &'a Parser<'_> {
             .iter()
             .fold(0, |acc: u8, x| acc.wrapping_add(*x));
         if checksum != 0xFF {
-            hprintln!("warn: checksum mismatch {} {:02x?} {} {}", checksum, &buf[start..1 + start + len as usize], start, len);
+            hprintln!(
+                "warn: checksum mismatch {} {:02x?} {} {}",
+                checksum,
+                &buf[start..1 + start + len as usize],
+                start,
+                len
+            );
             return None;
         }
 
@@ -371,6 +378,7 @@ pub enum Message {
     PressureTemp { pressure: f64, temp: f64 },
     ReadyForAscent,
     SetLaunchT(i64),
+    StageChange(mission::Stage),
 }
 
 impl Message {
@@ -398,6 +406,18 @@ impl Message {
                 Some(Message::PressureTemp { pressure, temp })
             }
             "RDYA" => Some(Message::ReadyForAscent),
+            "STGC" => {
+                let stage = match lexer.next_u8()? {
+                    0 => mission::Stage::PreLaunch,
+                    1 => mission::Stage::Ascent,
+                    2 => mission::Stage::Descent,
+                    3 => mission::Stage::Recovery,
+                    _ => {
+                        return None;
+                    }
+                };
+                Some(Message::StageChange(stage))
+            }
             "SETT" => {
                 let t = lexer.next_i64()?;
                 Some(Message::SetLaunchT(t))
@@ -407,6 +427,7 @@ impl Message {
     }
 
     pub fn data(&self) -> Vec<u8, MAX_PAYLOAD_SIZE> {
+        // get_logger().log(format_args!("{:?}", self));
         match self {
             Message::Ping(ping_id) => {
                 let mut payload = Vec::new();
@@ -445,7 +466,13 @@ impl Message {
                 payload.extend_from_slice(b"SETT");
                 payload.extend_from_slice(&t.to_be_bytes());
                 payload
-            },
+            }
+            Message::StageChange(stage) => {
+                let mut payload = Vec::new();
+                payload.extend_from_slice(b"STGC");
+                payload.extend_from_slice(&[*stage as u8]);
+                payload
+            }
         }
     }
 }
@@ -578,7 +605,6 @@ impl APIFrame {
     }
 
     pub async fn tx(self: &Self, buf: &mut [u8]) {
-        //hprintln!("Transmitting frame {:x?}", self);
         let bytes = self.serialize(buf).unwrap();
         crate::radio::tx(&buf[..bytes]).await;
     }
@@ -629,14 +655,14 @@ pub fn setup(
     let streams = StreamsTuple::new(DMA2);
     let tx_stream = streams.7;
     let rx_stream = streams.5;
-    let tx_buf = cortex_m::singleton!(:[u8; BUFFER_SIZE] = [0; BUFFER_SIZE]).unwrap();
-    let rx_buf1 = cortex_m::singleton!(:[u8; BUFFER_SIZE] = [0; BUFFER_SIZE]).unwrap();
-    let rx_buf2 = cortex_m::singleton!(:[u8; BUFFER_SIZE] = [0; BUFFER_SIZE]).unwrap();
+    let tx_buf_radio = cortex_m::singleton!(:[u8; BUFFER_SIZE] = [0; BUFFER_SIZE]).unwrap();
+    let rx_buf1_radio = cortex_m::singleton!(:[u8; BUFFER_SIZE] = [0; BUFFER_SIZE]).unwrap();
+    let rx_buf2_radio = cortex_m::singleton!(:[u8; BUFFER_SIZE] = [0; BUFFER_SIZE]).unwrap();
     let (tx, mut rx) = radio.split();
     let mut tx_transfer = Transfer::init_memory_to_peripheral(
         tx_stream,
         tx,
-        tx_buf as &mut [u8],
+        tx_buf_radio as &mut [u8],
         None,
         dma::config::DmaConfig::default()
             .memory_increment(true)
@@ -647,7 +673,7 @@ pub fn setup(
     let mut rx_transfer = Transfer::init_peripheral_to_memory(
         rx_stream,
         rx,
-        rx_buf1 as &mut [u8],
+        rx_buf1_radio as &mut [u8],
         None,
         dma::config::DmaConfig::default()
             .memory_increment(true)
@@ -663,7 +689,10 @@ pub fn setup(
         // SAFETY: Mutex makes access of static mutable variable safe
         unsafe { TX_TRANSFER.borrow(cs) }.replace(Some(tx_transfer));
         unsafe { RX_TRANSFER.borrow(cs) }.replace(Some(rx_transfer));
-        unsafe { RX_BUFFER.borrow(cs) }.replace(Some(rx_buf2));
+        unsafe { RX_BUFFER.borrow(cs) }.replace(Some(rx_buf2_radio));
+    });
+    cortex_m::interrupt::free(|cs| {
+        let mut tx_ref = unsafe { TX_TRANSFER.borrow(cs) }.borrow_mut();
     });
     unsafe {
         cortex_m::peripheral::NVIC::unmask(pac::Interrupt::DMA2_STREAM7);
@@ -689,6 +718,7 @@ fn DMA2_STREAM7() {
             // FIXME: A less restrictive ordering is probably possible
             TX_COMPLETE.store(true, Ordering::SeqCst);
         }
+
     });
 }
 
@@ -701,7 +731,7 @@ pub async fn parse_recvd_data() {
         // hprintln!("Received frame {:x?}", &rx_buf[..bytes]);
         for frame in &parser {
             if let Some(frame) = frame {
-                //get_logger().log(format_args!("Received frame {:x?}", frame));
+                // get_logger().log(format_args!("Received frame {:x?}", frame));
                 cortex_m::interrupt::free(|cs| {
                     let r = unsafe { UNHANDLED_FRAMES.borrow(cs) }
                         .borrow_mut()
