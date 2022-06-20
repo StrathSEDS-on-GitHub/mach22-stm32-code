@@ -1,6 +1,5 @@
 use core::{
-    borrow::Borrow,
-    cell::{BorrowMutError, RefCell},
+    cell::RefCell,
     cmp::min,
     sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering},
 };
@@ -21,9 +20,8 @@ use stm32f4xx_hal::{
     interrupt, pac,
     serial::{Rx, Tx},
 };
-use time::macros::offset;
 
-use crate::{futures::YieldFuture, get_timestamp, mission, sdcard::get_logger};
+use crate::{futures::YieldFuture, get_timestamp, mission};
 use stm32f4xx_hal as hal;
 
 pub struct Lexer<'a> {
@@ -197,7 +195,7 @@ impl<'a> Iterator for &'a Parser<'_> {
         match lexer.consume(0x7E) {
             Some(_) => {}
             None => {
-                hprintln!("warn: incorrect start byte. dropping some unknown bytes");
+                hprintln!("warn: radio incorrect start byte. dropping some unknown bytes");
                 lexer.skip_till(0x7E);
             }
         }
@@ -239,7 +237,7 @@ impl<'a> Iterator for &'a Parser<'_> {
                         let serial = lexer.next_u64()?;
                         let signal_strength = lexer.next_u8()?;
                         let identifier_str = lexer.next_null_terminated_str()?;
-                        let mut identifier = String::from(identifier_str);
+                        let identifier = String::from(identifier_str);
 
                         lexer.next_u16()?; // unused
 
@@ -370,12 +368,23 @@ pub enum APIFrame {
     },
 }
 
+pub const READINGS_PER_PRTM_PACKET: usize = 25;
+
 #[derive(Debug, PartialEq, Clone, Copy)]
 pub enum Message {
     Ping(u8),
     Pong(u8),
-    Gps { lat: f64, lon: f64, alt: f64 },
-    PressureTemp { pressure: f64, temp: f64 },
+    Gps {
+        timestamp: i64,
+        lat: [f64; 8],
+        long: [f64; 8],
+        alt: [f64; 8],
+    },
+    PressureTemp {
+        timestamp: i64,
+        pressure: [f32; READINGS_PER_PRTM_PACKET],
+        temp: [f32; READINGS_PER_PRTM_PACKET],
+    },
     ReadyForAscent,
     SetLaunchT(i64),
     StageChange(mission::Stage),
@@ -385,6 +394,7 @@ impl Message {
     pub fn parse(payload: &[u8]) -> Option<Self> {
         let mut lexer = Lexer::new(payload);
         let message_type = lexer.next_str(4)?;
+        hprintln!("message_type: {}", message_type);
         match message_type {
             "PING" => {
                 let ping_id = lexer.next_u8()?;
@@ -395,15 +405,35 @@ impl Message {
                 Some(Message::Pong(ping_id))
             }
             "GPSD" => {
-                let lat = lexer.next_f64()?;
-                let lon = lexer.next_f64()?;
-                let alt = lexer.next_f64()?;
-                Some(Message::Gps { lat, lon, alt })
+                let timestamp = lexer.next_i64()?;
+                let mut lat = [0.0; 8];
+                let mut long = [0.0; 8];
+                let mut alt = [0.0; 8];
+                for i in 0..8 {
+                    lat[i] = lexer.next_f64()?;
+                    long[i] = lexer.next_f64()?;
+                    alt[i] = lexer.next_f64()?;
+                }
+                Some(Message::Gps {
+                    timestamp,
+                    lat,
+                    long,
+                    alt,
+                })
             }
             "PRTM" => {
-                let pressure = lexer.next_f64()?;
-                let temp = lexer.next_f64()?;
-                Some(Message::PressureTemp { pressure, temp })
+                let timestamp = lexer.next_i64()?;
+                let mut pressure = [0.0; READINGS_PER_PRTM_PACKET];
+                let mut temp = [0.0; READINGS_PER_PRTM_PACKET];
+                for i in 0..READINGS_PER_PRTM_PACKET {
+                    pressure[i] = lexer.next_f32()?;
+                    temp[i] = lexer.next_f32()?;
+                }
+                Some(Message::PressureTemp {
+                    timestamp,
+                    pressure,
+                    temp,
+                })
             }
             "RDYA" => Some(Message::ReadyForAscent),
             "STGC" => {
@@ -431,46 +461,57 @@ impl Message {
         match self {
             Message::Ping(ping_id) => {
                 let mut payload = Vec::new();
-                payload.extend_from_slice(b"PING");
-                payload.push(*ping_id);
+                payload.extend_from_slice(b"PING").unwrap();
+                payload.push(*ping_id).unwrap();
                 payload
             }
             Message::Pong(ping_id) => {
                 let mut payload = Vec::new();
-                payload.extend_from_slice(b"PONG");
-                payload.push(*ping_id);
+                payload.extend_from_slice(b"PONG").unwrap();
+                payload.push(*ping_id).unwrap();
                 payload
             }
-            Message::Gps { lat, lon, alt } => {
+            Message::Gps {
+                timestamp,
+                lat,
+                long: lon,
+                alt,
+            } => {
                 let mut payload = Vec::new();
-                payload.extend_from_slice(b"GPSD");
-                payload.extend_from_slice(&lat.to_be_bytes());
-                payload.extend_from_slice(&lon.to_be_bytes());
-                payload.extend_from_slice(&alt.to_be_bytes());
+                payload.extend_from_slice(b"GPSD").unwrap();
+                payload.extend_from_slice(&timestamp.to_be_bytes()).unwrap();
+                for i in 0..8 {
+                    payload.extend_from_slice(&lat[i].to_be_bytes()).unwrap();
+                    payload.extend_from_slice(&lon[i].to_be_bytes()).unwrap();
+                    payload.extend_from_slice(&alt[i].to_be_bytes()).unwrap();
+                }
                 payload
             }
-            Message::PressureTemp { pressure, temp } => {
+            Message::PressureTemp { timestamp, pressure, temp } => {
                 let mut payload = Vec::new();
-                payload.extend_from_slice(b"PRTM");
-                payload.extend_from_slice(&pressure.to_be_bytes());
-                payload.extend_from_slice(&temp.to_be_bytes());
+                payload.extend_from_slice(b"PRTM").unwrap();
+                payload.extend_from_slice(&timestamp.to_be_bytes()).unwrap();
+                for i in 0..READINGS_PER_PRTM_PACKET {
+                    payload.extend_from_slice(&pressure[i].to_be_bytes()).unwrap();
+                    payload.extend_from_slice(&temp[i].to_be_bytes()).unwrap();
+                }
                 payload
             }
             Message::ReadyForAscent => {
                 let mut payload = Vec::new();
-                payload.extend_from_slice(b"RDYA");
+                payload.extend_from_slice(b"RDYA").unwrap();
                 payload
             }
             Message::SetLaunchT(t) => {
                 let mut payload = Vec::new();
-                payload.extend_from_slice(b"SETT");
-                payload.extend_from_slice(&t.to_be_bytes());
+                payload.extend_from_slice(b"SETT").unwrap();
+                payload.extend_from_slice(&t.to_be_bytes()).unwrap();
                 payload
             }
             Message::StageChange(stage) => {
                 let mut payload = Vec::new();
-                payload.extend_from_slice(b"STGC");
-                payload.extend_from_slice(&[*stage as u8]);
+                payload.extend_from_slice(b"STGC").unwrap();
+                payload.extend_from_slice(&[*stage as u8]).unwrap();
                 payload
             }
         }
@@ -643,7 +684,7 @@ impl APIFrame {
 }
 
 pub fn setup(
-    DMA2: pac::DMA2,
+    dma2: pac::DMA2,
     radio: hal::serial::Serial<
         pac::USART1,
         (
@@ -652,7 +693,7 @@ pub fn setup(
         ),
     >,
 ) {
-    let streams = StreamsTuple::new(DMA2);
+    let streams = StreamsTuple::new(dma2);
     let tx_stream = streams.7;
     let rx_stream = streams.5;
     let tx_buf_radio = cortex_m::singleton!(:[u8; BUFFER_SIZE] = [0; BUFFER_SIZE]).unwrap();
@@ -691,9 +732,6 @@ pub fn setup(
         unsafe { RX_TRANSFER.borrow(cs) }.replace(Some(rx_transfer));
         unsafe { RX_BUFFER.borrow(cs) }.replace(Some(rx_buf2_radio));
     });
-    cortex_m::interrupt::free(|cs| {
-        let mut tx_ref = unsafe { TX_TRANSFER.borrow(cs) }.borrow_mut();
-    });
     unsafe {
         cortex_m::peripheral::NVIC::unmask(pac::Interrupt::DMA2_STREAM7);
         cortex_m::peripheral::NVIC::unmask(pac::Interrupt::DMA2_STREAM5);
@@ -718,7 +756,6 @@ fn DMA2_STREAM7() {
             // FIXME: A less restrictive ordering is probably possible
             TX_COMPLETE.store(true, Ordering::SeqCst);
         }
-
     });
 }
 

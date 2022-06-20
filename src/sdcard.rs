@@ -38,10 +38,10 @@ pub struct FixedWriter<'a>(pub &'a mut [u8], pub usize);
 
 impl<'a> Write for FixedWriter<'a> {
     fn write_str(&mut self, s: &str) -> Result<(), core::fmt::Error> {
-        if self.1 >= self.0.len() {
-            return Ok(());
-        }
         for c in s.chars() {
+            if self.1 >= self.0.len() {
+                return Ok(());
+            }
             self.0[self.1] = c as u8;
             self.1 += 1;
         }
@@ -117,16 +117,20 @@ impl SdLogger {
         let mut buf = [0u8; 32];
         let mut buf = FixedWriter(&mut buf, 0);
 
-        let (h, m, s, milli) = cortex_m::interrupt::free(|cs| {
+        let ((h, m, s), millis) = cortex_m::interrupt::free(|cs| {
             // SAFETY: Mutex makes access of static mutable variable safe
-            unsafe { RTC.borrow(cs) }
-                .borrow_mut()
-                .as_mut()
-                .unwrap()
-                .get_datetime()
-                .as_hms_milli()
+            let mut borrow = unsafe { RTC.borrow(cs) }.borrow_mut();
+            let hms = borrow.as_mut().unwrap().get_datetime().as_hms();
+
+            let ss = unsafe { &*stm32f4xx_hal::pac::RTC::ptr() }
+                .ssr
+                .read()
+                .ss()
+                .bits();
+            let millis = (1000 * (255 - ss)) / (256);
+            (hms, millis)
         });
-        write!(buf, "{:02}:{:02}:{:02}.{:03}: ", h, m, s, milli).unwrap();
+        write!(buf, "{:02}:{:02}:{:02}.{:03}: ", h, m, s, millis).unwrap();
         loop {
             if self
                 .cont

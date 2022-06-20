@@ -7,9 +7,9 @@ use core::{
 use crate::{
     futures::{NbFuture, YieldFuture},
     gps,
-    radio::{self, APIFrame},
+    radio::{self, APIFrame, READINGS_PER_PRTM_PACKET},
     sdcard::{self, get_logger, FixedWriter},
-    usb_serial::get_serial,
+    usb_serial::get_serial, rickroll::{self, rickroll_everyone}, get_timestamp,
 };
 use cortex_m::interrupt::Mutex;
 use cortex_m_semihosting::hprintln;
@@ -19,10 +19,14 @@ use heapless::{Deque, Vec};
 use libm::pow;
 use phf::phf_map;
 use stm32f4xx_hal::{
+    gpio::ExtiPin,
+    interrupt,
     prelude::_fugit_DurationExtU32,
     timer::{self, CounterMs},
 };
 use time::{macros::date, Date, Month, OffsetDateTime, PrimitiveDateTime, Time};
+
+static FORCE_ADVANCE_STAGE: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Designator {
@@ -60,7 +64,7 @@ pub enum Stage {
 pub struct MissionState {
     launch_t: Cell<i64>,
     stage: Cell<Stage>,
-    alt_readings: Mutex<RefCell<Deque<f64, 15>>>,
+    alt_readings: Mutex<RefCell<Deque<f32, READINGS_PER_PRTM_PACKET>>>,
 }
 
 impl MissionState {
@@ -99,19 +103,23 @@ impl MissionState {
 
     pub async fn handle_radio_communications(self: &Self) {
         loop {
-            let frame = radio::try_claim_frame(|frame| match frame {
-                radio::APIFrame::ReceivePacket {
-                    message: Some(message),
-                    ..
-                } => match message {
-                    radio::Message::Ping(_) => true,
-                    radio::Message::Gps { .. } => true,
-                    radio::Message::PressureTemp { .. } => true,
-                    radio::Message::SetLaunchT(_) => true,
-                    radio::Message::StageChange(_) => true,
+            let frame = radio::try_claim_frame(|frame| {
+                let interest = match frame {
+                    radio::APIFrame::ReceivePacket {
+                        source_address,
+                        message: Some(message),
+                        ..
+                    } => match message {
+                        radio::Message::Ping(_) => true,
+                        radio::Message::Gps { .. } => true,
+                        radio::Message::PressureTemp { .. } => true,
+                        radio::Message::SetLaunchT(_) => true,
+                        radio::Message::StageChange(_) => false,
+                        _ => false,
+                    },
                     _ => false,
-                },
-                _ => false,
+                };
+                interest
             });
             if let Some(radio::APIFrame::ReceivePacket {
                 source_address,
@@ -121,7 +129,7 @@ impl MissionState {
             {
                 match message {
                     radio::Message::Ping(id) => {
-                        hprintln!("Received ping from {}", source_address);
+                        get_logger().log(format_args!("Received ping from {}", source_address));
                         let reply = radio::Message::Pong(id);
                         let tx_req = radio::APIFrame::TransmitRequest {
                             frame_id: radio::next_id(),
@@ -134,25 +142,23 @@ impl MissionState {
                         tx_req.tx(&mut buf).await;
                         tx_req.await_response().await;
                     }
-                    radio::Message::Gps {
-                        lat,
-                        lon: long,
-                        alt,
-                    } => {
+                    radio::Message::Gps { timestamp, lat, long, alt } => {
                         write!(
                             get_serial(),
-                            "gpsd,{:016x},{},{},{}\n",
+                            "gpsd,{:016x},{},{:?},{:?},{:?}\n",
                             source_address,
+                            timestamp,
                             lat,
                             long,
                             alt
                         )
                         .unwrap();
                     }
-                    radio::Message::PressureTemp { pressure, temp } => {
+                    radio::Message::PressureTemp { timestamp, pressure, temp } => {
                         write!(
                             get_serial(),
-                            "prtp,{:016x},{},{}\n",
+                            "prtp,{:016x},{},{:?},{:?}\n",
+                            timestamp,
                             source_address,
                             pressure,
                             temp
@@ -166,12 +172,6 @@ impl MissionState {
                         } else {
                             get_logger().log(format_args!("New launch time {}z", t));
                         }
-                    }
-                    radio::Message::StageChange(stage) => {
-                        get_logger().log(format_args!(
-                            "{:x} stage change {:?}",
-                            source_address, stage
-                        ));
                     }
                     _ => unreachable!(),
                 };
@@ -222,27 +222,81 @@ impl MissionState {
 
         self.wait_for_launch_t().await;
 
-        get_logger().log_str("Launch!");
+        get_logger().log_str("info: Launch!");
         self.stage.replace(Stage::Ascent);
         if !Self::is_ground_station() {
             self.announce_stage_change().await;
+        } else {
+            self.wait_for_stage_change_messages(Stage::Ascent).await;
         }
 
         // ASCENT STAGE
-        self.wait_for_ascent().await;
+        self.wait_for_ascent_completion().await;
         self.stage.replace(Stage::Descent);
         if !Self::is_ground_station() {
             self.announce_stage_change().await;
+        } else {
+            self.wait_for_stage_change_messages(Stage::Descent).await;
         }
+        get_logger().log_str("info: Descent!");
 
         // DESCENT STAGE
-        self.wait_for_descent().await;
+        self.wait_for_descent_completion().await;
         self.stage.replace(Stage::Recovery);
         if !Self::is_ground_station() {
             self.announce_stage_change().await;
+        } else {
+            self.wait_for_stage_change_messages(Stage::Recovery).await;
         }
+        get_logger().log_str("info: Recovery.");
 
-        loop {}
+        if Self::is_ground_station() {
+            loop {
+                YieldFuture::new().await;
+            }
+        } else {
+        }
+    }
+
+    async fn wait_for_stage_change_messages(&self, stage: Stage) {
+        let ascent_nodes = NODES
+            .values()
+            .filter(|it| !matches!(*it, NodeType::GroundStation(_)))
+            .count();
+        let mut ready_count = 0;
+        loop {
+            let frame = radio::try_claim_frame(|frame| match frame {
+                radio::APIFrame::ReceivePacket {
+                    message: Some(message),
+                    ..
+                } => match message {
+                    radio::Message::StageChange(new_stage) => *new_stage == stage,
+                    _ => false,
+                },
+                _ => false,
+            });
+            if let Some(radio::APIFrame::ReceivePacket {
+                source_address,
+                message: Some(message),
+                ..
+            }) = frame
+            {
+                match message {
+                    radio::Message::StageChange(stage) => {
+                        get_logger().log(format_args!(
+                            "{:x} entering stage {:?}",
+                            source_address, stage
+                        ));
+                        ready_count += 1;
+                        if ready_count == ascent_nodes {
+                            break;
+                        }
+                    }
+                    _ => unreachable!(),
+                };
+            }
+            YieldFuture::new().await;
+        }
     }
 
     async fn announce_stage_change(&self) {
@@ -275,32 +329,41 @@ impl MissionState {
         }
     }
 
-    async fn wait_for_ascent(&self) {
-        loop {
-            let mut readings = [0.0; 15];
-            cortex_m::interrupt::free(|cs| {
-                let alt_readings = self.alt_readings.borrow(cs).borrow();
-                let mut i = 0;
-                for item in alt_readings.iter() {
-                    readings[i] = *item;
-                    i += 1;
+    async fn wait_for_ascent_completion(&self) {
+        if Self::is_ground_station() {
+        } else {
+            loop {
+                let mut readings = [0.0; READINGS_PER_PRTM_PACKET];
+                cortex_m::interrupt::free(|cs| {
+                    let alt_readings = self.alt_readings.borrow(cs).borrow();
+                    let mut i = 0;
+                    for item in alt_readings.iter() {
+                        readings[i] = *item;
+                        i += 1;
+                    }
+                });
+                let mut diffs = [0.0; READINGS_PER_PRTM_PACKET - 1];
+                for i in 0..READINGS_PER_PRTM_PACKET - 1 {
+                    diffs[i] = readings[i + 1] - readings[i];
                 }
-            });
-            let mut diffs = [0.0; 14];
-            for i in 0..14 {
-                diffs[i] = readings[i + 1] - readings[i];
+                let average_diff =
+                    diffs.iter().sum::<f32>() / (READINGS_PER_PRTM_PACKET - 1) as f32;
+                if average_diff < -0.5 {
+                    break;
+                }
+
+                if FORCE_ADVANCE_STAGE.load(Ordering::SeqCst) {
+                    FORCE_ADVANCE_STAGE.store(false, Ordering::SeqCst);
+                    break;
+                }
+                YieldFuture::new().await;
             }
-            let average_diff = diffs.iter().sum::<f64>() / 15.0;
-            if average_diff < -0.5 {
-                break;
-            }
-            YieldFuture::new().await;
         }
     }
 
-    async fn wait_for_descent(&self) {
+    async fn wait_for_descent_completion(&self) {
         loop {
-            let mut readings = [0.0; 15];
+            let mut readings = [0.0; READINGS_PER_PRTM_PACKET];
             cortex_m::interrupt::free(|cs| {
                 let alt_readings = self.alt_readings.borrow(cs).borrow();
                 let mut i = 0;
@@ -309,12 +372,17 @@ impl MissionState {
                     i += 1;
                 }
             });
-            let mut diffs = [0.0; 14];
-            for i in 0..14 {
+            let mut diffs = [0.0; READINGS_PER_PRTM_PACKET - 1];
+            for i in 0..READINGS_PER_PRTM_PACKET - 1 {
                 diffs[i] = readings[i + 1] - readings[i];
             }
-            let average_diff = diffs.iter().sum::<f64>() / 15.0;
+            let average_diff = diffs.iter().sum::<f32>() / (READINGS_PER_PRTM_PACKET - 1) as f32;
             if average_diff < -0.03 {
+                break;
+            }
+
+            if FORCE_ADVANCE_STAGE.load(Ordering::SeqCst) {
+                FORCE_ADVANCE_STAGE.store(false, Ordering::SeqCst);
                 break;
             }
             YieldFuture::new().await;
@@ -332,6 +400,10 @@ impl MissionState {
             });
             //get_logger().log(format_args!("Current time: {}. Launch at {}", current_time, self.launch_t.get()));
             if current_time > launch_t && launch_t > 0 {
+                break;
+            }
+            if FORCE_ADVANCE_STAGE.load(Ordering::SeqCst) {
+                FORCE_ADVANCE_STAGE.store(false, Ordering::SeqCst);
                 break;
             }
             YieldFuture::new().await;
@@ -390,7 +462,7 @@ impl MissionState {
     async fn wait_for_gps(&self) {
         gps::tx(b"$PMTK251,115200*1F\r\n").await;
         gps::change_baudrate(115200).await;
-        for i in 0..10 {
+        for _ in 0..10 {
             gps::tx(b"$PMTK220,100*2F\r\n").await;
         }
         while !GPS_HAS_FIX.load(Ordering::SeqCst) {
@@ -429,7 +501,7 @@ impl MissionState {
                             rtc.as_mut().unwrap().set_datetime(&date_time).unwrap();
                         });
                     } else {
-                        hprintln!("Unknown message");
+                        hprintln!("Unknown message {:?}", line);
                     }
                 }
             }
@@ -475,9 +547,12 @@ impl MissionState {
     }
 
     async fn handle_gps_packets(self: &Self) {
+        let mut lat_readings = [0.0; 8];
+        let mut long_readings = [0.0; 8];
+        let mut alt_readings = [0.0; 8];
+        let mut index = 0;
         loop {
             let parse_result = gps::next_sentence().await;
-
             match parse_result {
                 nmea0183::ParseResult::RMC(Some(rmc)) => {
                     get_logger().log(format_args!("RMC: {:?}", rmc));
@@ -514,23 +589,31 @@ impl MissionState {
                 nmea0183::ParseResult::GGA(Some(gga)) => {
                     get_logger().log(format_args!("GGA: {:?}", gga));
                     //hprintln!("GGA: {:?}", gga);
-                    let msg = radio::Message::Gps {
-                        lat: gga.latitude.as_f64(),
-                        lon: gga.longitude.as_f64(),
-                        alt: gga.altitude.meters as f64,
-                    };
-                    let mut buf = [0u8; 256];
-                    let ground_stations = Self::get_ground_stations();
-                    for gs in ground_stations {
-                        let tx = radio::APIFrame::TransmitRequest {
-                            frame_id: radio::next_id(),
-                            destination_address: gs,
-                            broadcast_radius: 0,
-                            transmit_options: 0,
-                            data: msg.data(),
+                    lat_readings[index] = gga.latitude.as_f64();
+                    long_readings[index] = gga.longitude.as_f64();
+                    alt_readings[index] = gga.altitude.meters as f64;
+                    index += 1;
+                    if index == 8 {
+                        index = 0;
+                        let msg = radio::Message::Gps {
+                            timestamp: get_timestamp(),
+                            lat: lat_readings,
+                            long: long_readings,
+                            alt: alt_readings,
                         };
-                        tx.tx(&mut buf).await;
-                        tx.await_response().await;
+                        let mut buf = [0u8; 256];
+                        let ground_stations = Self::get_ground_stations();
+                        for gs in ground_stations {
+                            let tx = radio::APIFrame::TransmitRequest {
+                                frame_id: radio::next_id(),
+                                destination_address: gs,
+                                broadcast_radius: 0,
+                                transmit_options: 0,
+                                data: msg.data(),
+                            };
+                            tx.tx(&mut buf).await;
+                            tx.await_response().await;
+                        }
                     }
                 }
                 _ => {} // Not a sentence we care about
@@ -619,9 +702,9 @@ impl MissionState {
                     radio::APIFrame::ReceivePacket {
                         source_address,
                         message,
+                        payload,
                         ..
                     } => {
-                        hprintln!("message {:?}", message);
                         match message {
                             Some(radio::Message::Pong(x)) => {
                                 if *source_address == peer && *x == id {
@@ -659,6 +742,9 @@ impl MissionState {
         I2C::Error: core::fmt::Debug,
     {
         timer.start(100.millis()).unwrap();
+        let mut pressure_readings = [0.0; READINGS_PER_PRTM_PACKET];
+        let mut temperature_readings = [0.0; READINGS_PER_PRTM_PACKET];
+        let mut pt_index = 0;
         loop {
             let values = bmp.sensor_values().unwrap();
 
@@ -666,45 +752,54 @@ impl MissionState {
                 * (pow(101788.0 / (values.pressure), 1.0 / 5.257) - 1.0)
                 * (values.temperature + 273.15);
 
-            get_logger().log(format_args!(
-                "PTA: {{ pressure: {:.2}, temp: {:.2}, alt: {:.2} }}",
-                values.pressure, values.temperature, alt
-            ));
-
             cortex_m::interrupt::free(|cs| {
                 let mut alt_readings = self.alt_readings.borrow(cs).borrow_mut();
+
                 if alt_readings.len() == alt_readings.capacity() {
                     alt_readings.pop_front();
                 }
                 // hprintln!("alt: {:.2}", alt_readings.iter().sum::<f64>()/alt_readings.len() as f64);
-                alt_readings.push_back(alt).unwrap();
+                alt_readings.push_back(alt as f32).unwrap();
             });
 
             let ground_stations = NODES
                 .keys()
                 .filter(|x| matches!(NODES[x], NodeType::GroundStation(_)));
 
-            let data = radio::Message::PressureTemp {
-                pressure: values.pressure,
-                temp: values.temperature,
+            pressure_readings[pt_index] = values.pressure as f32;
+            temperature_readings[pt_index] = values.temperature as f32;
+            pt_index += 1;
+            if pt_index == READINGS_PER_PRTM_PACKET {
+                pt_index = 0;
+                let data = radio::Message::PressureTemp {
+                    timestamp: get_timestamp(),
+                    pressure: pressure_readings,
+                    temp: temperature_readings,
+                }
+                .data();
+
+                if self.should_send_sensor_data() {
+                    for gs in ground_stations {
+                        let frame = radio::APIFrame::TransmitRequest {
+                            frame_id: radio::next_id(),
+                            destination_address: *gs,
+                            broadcast_radius: 0,
+                            transmit_options: 0,
+                            data: data.clone(),
+                        };
+
+                        let mut buf = [0u8; 512];
+                        frame.tx(&mut buf).await;
+                        let resp = frame.await_response().await; // for now discard response
+                        hprintln!("info: Sent sensor data to {:x}. {:?}", *gs, resp);
+                    }
+
+                    get_logger().log(format_args!(
+                        "PTA: {{ pressure: {:?}, temp: {:?} }}",
+                        pressure_readings, temperature_readings
+                    ));
+                }
             }
-            .data();
-
-            // if self.should_send_sensor_data() {
-            //     for gs in ground_stations {
-            //         let frame = radio::APIFrame::TransmitRequest {
-            //             frame_id: radio::next_id(),
-            //             destination_address: *gs,
-            //             broadcast_radius: 0,
-            //             transmit_options: 0,
-            //             data: data.clone(),
-            //         };
-
-            //         let mut buf = [0u8; 128];
-            //         frame.tx(&mut buf).await;
-            //         frame.await_response().await; // for now discard response
-            //     }
-            // }
             NbFuture::new(|| timer.wait()).await.unwrap();
         }
     }
@@ -737,4 +832,16 @@ impl MissionState {
         }
         get_logger().log_str("info: ReadyForAscent sent");
     }
+}
+
+#[interrupt]
+fn EXTI0() {
+    cortex_m::interrupt::free(|cs|
+        // SAFETY: Mutex makes access of static mutable variable safe
+        {
+            let mut btn_ref = unsafe { crate::USER_BUTTON.borrow(cs) }.borrow_mut();
+            let btn = btn_ref.as_mut().unwrap();
+            btn.clear_interrupt_pending_bit();
+            FORCE_ADVANCE_STAGE.store(true, Ordering::SeqCst);
+    });
 }

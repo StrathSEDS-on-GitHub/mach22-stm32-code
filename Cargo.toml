@@ -3,6 +3,9 @@ name = "cansat"
 version = "0.1.0"
 edition = "2021"
 
+[profile.dev]
+opt-level = "z"
+
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
@@ -13,7 +16,7 @@ cortex-m-rt = "0.7"
 
 cassette = "0.2"
 futures = { version = "0.3", default-features = false, features= ["async-await"] }
-cortex-m-semihosting =  { version = "0.5.0", features = [] }
+cortex-m-semihosting =  { version = "0.5.0", features = ["no-semihosting"] }
 bmp388 = "0.1.0"
 libm = "0.2.2" 
 time={ version="0.3.9", default-features = false, features=["macros"]}

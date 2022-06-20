@@ -156,13 +156,13 @@ pub async fn change_baudrate(baudrate: u32) {
                     _marker: PhantomData,
                 })
             };
-            let pa2: gpio::Pin<'A', 2, Input> = unsafe {
+            let pa2 = unsafe {
                 core::mem::transmute::<FakePin<'A', 2, Input>, gpio::Pin<'A', 2, Input>>(FakePin {
                     _mode: PhantomData::<gpio::Input>,
                 })
             };
 
-            let pa3: gpio::Pin<'A', 3, Input> = unsafe {
+            let pa3 = unsafe {
                 core::mem::transmute::<FakePin<'A', 3, Input>, gpio::Pin<'A', 3, Input>>(FakePin {
                     _mode: PhantomData::<gpio::Input>,
                 })
@@ -222,11 +222,13 @@ static mut GPS_SENTENCE_BUFFER: Mutex<RefCell<Option<Deque<ParseResult, 64>>>> =
 pub async fn next_sentence() -> ParseResult {
     loop {
         if let Some(x) = cortex_m::interrupt::free(|cs| {
-            unsafe { GPS_SENTENCE_BUFFER.borrow(cs) }
+            let next = unsafe { GPS_SENTENCE_BUFFER.borrow(cs) }
                 .borrow_mut()
                 .as_mut()
                 .unwrap()
-                .pop_front()
+                .pop_front();
+
+            next
         }) {
             return x;
         }
@@ -262,22 +264,21 @@ pub async fn parse_recvd_data() {
     let mut parser = nmea0183::Parser::new();
 
     loop {
-        /*get_logger().log(format_args!(
-            "{}",
-            core::str::from_utf8(&rx_buf[..bytes])
-        )); */
         // hprintln!("{:?}", core::str::from_utf8(&rx_buf[..bytes]));
         for parse_result in parser.parse_from_bytes(&rx_buf[..bytes]) {
             if let Ok(parse_result) = parse_result {
                 cortex_m::interrupt::free(|cs| {
-                    let failed = unsafe { GPS_SENTENCE_BUFFER.borrow(cs) }
-                        .borrow_mut()
-                        .as_mut()
-                        .unwrap()
-                        .push_back(parse_result)
-                        .is_err();
-                    if failed {
-                        get_logger().log_str("warn: GPS buffer full. packet discarded.");
+                    let mut buffer_ref = unsafe { GPS_SENTENCE_BUFFER.borrow(cs) }
+                        .borrow_mut();
+                    let buffer = buffer_ref.as_mut()
+                        .unwrap();
+                    match buffer.push_back(parse_result) {
+                        Ok(()) => {},
+                        Err(parse_result) => {
+                            get_logger().log_str("warn: GPS buffer full. packet discarded.");
+                            buffer.pop_front();
+                            buffer.push_back(parse_result);
+                        }
                     }
                 });
             }
@@ -395,7 +396,6 @@ pub async fn rx(rx_buf: &mut [u8]) -> usize {
         for i in bytes_copied..bytes_available {
             buf[i - bytes_copied] = buf[i]
         }
-
         bytes_copied
     })
 }
