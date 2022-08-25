@@ -69,7 +69,7 @@ pub async fn rickroll_everyone() {
     let chunks = MELODY.chunks(2);
     let note_length_ms: i32 = 60000 * 4 / TEMPO;
     pwm.enable();
-    pwm.set_duty(pwm.get_max_duty()/2);
+    pwm.set_duty(pwm.get_max_duty() / 2);
     for note_and_duration in chunks {
         let (note, divider) = (note_and_duration[0], note_and_duration[1]);
         // calculates the duration of each note

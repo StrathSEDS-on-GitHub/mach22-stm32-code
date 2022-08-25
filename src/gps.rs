@@ -396,6 +396,7 @@ pub async fn rx(rx_buf: &mut [u8]) -> usize {
         for i in bytes_copied..bytes_available {
             buf[i - bytes_copied] = buf[i]
         }
+        hprintln!("{:?}", core::str::from_utf8(&rx_buf[..bytes_copied]));
         bytes_copied
     })
 }

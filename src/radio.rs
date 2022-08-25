@@ -21,7 +21,7 @@ use stm32f4xx_hal::{
     serial::{Rx, Tx},
 };
 
-use crate::{futures::YieldFuture, get_timestamp, mission};
+use crate::{futures::YieldFuture, get_timestamp, mission, sdcard::get_logger};
 use stm32f4xx_hal as hal;
 
 pub struct Lexer<'a> {
@@ -46,6 +46,12 @@ impl<'a> Lexer<'a> {
     pub fn next_u16(self: &mut Self) -> Option<u16> {
         let it = u16::from_be_bytes(self.data.get(self.idx..self.idx + 2)?.try_into().ok()?);
         self.idx += 2;
+        Some(it)
+    }
+
+    pub fn next_u32(self: &mut Self) -> Option<u32> {
+        let it = u32::from_be_bytes(self.data.get(self.idx..self.idx + 4)?.try_into().ok()?);
+        self.idx += 4;
         Some(it)
     }
 
@@ -261,6 +267,17 @@ impl<'a> Iterator for &'a Parser<'_> {
                             },
                         }))
                     }
+                    "DB" => {
+                        let rssi = lexer.next_u8()?;
+                        Some(Some(APIFrame::LocalCommandResponse {
+                            frame_id,
+                            command: command_name.as_bytes().try_into().unwrap(),
+                            success: command_success,
+                            data: LocalCommandResponseData::RSSI {
+                                rssi,
+                            },
+                        }))
+                    }
                     _ => todo!("NYI: {}", command_name),
                 }
             }
@@ -292,6 +309,29 @@ impl<'a> Iterator for &'a Parser<'_> {
                     recv_options,
                     payload,
                     message,
+                }))
+            }
+            0x8D => {
+                let source_event = lexer.next_u8()?;
+                let data_len = lexer.next_u8()?;
+                let timestamp = lexer.next_u32()?;
+                let ack_timeout_count = lexer.next_u8()?;
+                let tx_blocked = lexer.next_u8()?;
+                lexer.next_u8(); // reserved
+                let destination = lexer.next_u64()?;
+                let source = lexer.next_u64()?;
+                let responder = lexer.next_u64()?;
+                let receiver = lexer.next_u64()?;
+                Some(Some(APIFrame::RouteInfo {
+                    source_event,
+                    data_len,
+                    timestamp,
+                    ack_timeout_count,
+                    tx_blocked,
+                    destination,
+                    source,
+                    responder,
+                    receiver,
                 }))
             }
             _ => {
@@ -330,6 +370,9 @@ pub enum LocalCommandResponseData {
         profile_id: u16,
         manufacturer: u16,
     },
+    RSSI {
+        rssi: u8,
+    },
     NoData,
 }
 
@@ -366,6 +409,17 @@ pub enum APIFrame {
         status: u8,
         discovery_status: u8,
     },
+    RouteInfo {
+        source_event: u8,
+        data_len: u8,
+        timestamp: u32,
+        ack_timeout_count: u8,
+        tx_blocked: u8,
+        destination: u64,
+        source: u64,
+        responder: u64,
+        receiver: u64,
+    }
 }
 
 pub const READINGS_PER_PRTM_PACKET: usize = 25;
@@ -487,12 +541,18 @@ impl Message {
                 }
                 payload
             }
-            Message::PressureTemp { timestamp, pressure, temp } => {
+            Message::PressureTemp {
+                timestamp,
+                pressure,
+                temp,
+            } => {
                 let mut payload = Vec::new();
                 payload.extend_from_slice(b"PRTM").unwrap();
                 payload.extend_from_slice(&timestamp.to_be_bytes()).unwrap();
                 for i in 0..READINGS_PER_PRTM_PACKET {
-                    payload.extend_from_slice(&pressure[i].to_be_bytes()).unwrap();
+                    payload
+                        .extend_from_slice(&pressure[i].to_be_bytes())
+                        .unwrap();
                     payload.extend_from_slice(&temp[i].to_be_bytes()).unwrap();
                 }
                 payload
@@ -547,7 +607,7 @@ where
     })
 }
 
-pub async fn claim_frame<F>(mut f: F) -> Option<APIFrame>
+pub async fn claim_frame<F>(mut f: F) -> APIFrame
 where
     F: FnMut(&APIFrame) -> bool,
 {
@@ -562,10 +622,33 @@ where
             }
             None
         }) {
+            return frame;
+        }
+        YieldFuture::new().await;
+    }
+}
+
+pub async fn claim_frame_timeout<F>(mut f: F, timeout: i64) -> Option<APIFrame>
+where
+    F: FnMut(&APIFrame) -> bool,
+{
+    let start_time = get_timestamp();
+    while get_timestamp() - start_time < timeout {
+        if let Some(frame) = cortex_m::interrupt::free(|cs| {
+            let mut frames = unsafe { UNHANDLED_FRAMES.borrow(cs) }.borrow_mut();
+            for i in 0..frames.len() {
+                if f(&frames[i]) {
+                    let frame = frames.swap_remove(i);
+                    return Some(frame);
+                }
+            }
+            None
+        }) {
             return Some(frame);
         }
         YieldFuture::new().await;
     }
+    None
 }
 
 impl APIFrame {
@@ -630,6 +713,7 @@ impl APIFrame {
             }
             APIFrame::ReceivePacket { .. } => unimplemented!(),
             APIFrame::ExtendedTransmitStatus { .. } => unimplemented!(),
+            APIFrame::RouteInfo { .. } => unimplemented!(),
         }
 
         *buf.get_mut(1)? = (bytes - 3 >> 8) as u8;
@@ -679,6 +763,7 @@ impl APIFrame {
             APIFrame::TransmitRequest { frame_id, .. } => *frame_id,
             APIFrame::ReceivePacket { .. } => 0, // not applicable
             APIFrame::ExtendedTransmitStatus { frame_id, .. } => *frame_id,
+            APIFrame::RouteInfo { .. } => 0, // not applicable
         }
     }
 }

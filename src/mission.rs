@@ -6,10 +6,11 @@ use core::{
 
 use crate::{
     futures::{NbFuture, YieldFuture},
-    gps,
-    radio::{self, APIFrame, READINGS_PER_PRTM_PACKET},
+    get_timestamp, gps,
+    radio::{self, APIFrame, LocalCommandResponseData, READINGS_PER_PRTM_PACKET},
+    rickroll::{self, rickroll_everyone},
     sdcard::{self, get_logger, FixedWriter},
-    usb_serial::get_serial, rickroll::{self, rickroll_everyone}, get_timestamp,
+    usb_serial::get_serial,
 };
 use cortex_m::interrupt::Mutex;
 use cortex_m_semihosting::hprintln;
@@ -41,16 +42,21 @@ pub enum NodeType {
     Rocket,
 }
 
-pub const NODE_TYPE: NodeType = NodeType::Rocket;
+pub const NODE_TYPE: NodeType = NodeType::CanSat(Designator::A);
 
 const NODES: phf::Map<u64, NodeType> = phf_map! {
     //0x0013A20041EFD4CCu64 => NodeType::CanSat(Designator::A),
-    0x0013A20041EFD4D0u64 => NodeType::GroundStation(Designator::A),
-    0x0013A20041EFD44Au64 => NodeType::Rocket,
+    0x0013A20041EFD4D5u64 => NodeType::GroundStation(Designator::B),
+    0x0013A20041EFD44Au64 => NodeType::CanSat(Designator::A),
+    0x0013A20041EFD4CCu64 => NodeType::GroundStation(Designator::A),
+    0x0013A20041EFD4D0u64 => NodeType::Rocket
 };
 
 const PEER_LEN: usize = 1;
 static GPS_HAS_FIX: AtomicBool = AtomicBool::new(false);
+
+const ASCENT_TIMEOUT: i64 = 20;
+const DESCENT_TIMEOUT: i64 = 600;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -142,10 +148,15 @@ impl MissionState {
                         tx_req.tx(&mut buf).await;
                         tx_req.await_response().await;
                     }
-                    radio::Message::Gps { timestamp, lat, long, alt } => {
+                    radio::Message::Gps {
+                        timestamp,
+                        lat,
+                        long,
+                        alt,
+                    } => {
                         write!(
                             get_serial(),
-                            "gpsd,{:016x},{},{:?},{:?},{:?}\n",
+                            "gpsd|{:016x}|{}|{:?}|{:?}|{:?}\n",
                             source_address,
                             timestamp,
                             lat,
@@ -154,21 +165,41 @@ impl MissionState {
                         )
                         .unwrap();
                     }
-                    radio::Message::PressureTemp { timestamp, pressure, temp } => {
+                    radio::Message::PressureTemp {
+                        timestamp,
+                        pressure,
+                        temp,
+                    } => {
                         write!(
                             get_serial(),
-                            "prtp,{:016x},{},{:?},{:?}\n",
+                            "prtp|{:016x}|{}|{:?}|{:?}\n",
                             timestamp,
                             source_address,
                             pressure,
                             temp
                         )
                         .unwrap();
+                        let frame = APIFrame::LocalCommandRequest {
+                            frame_id: radio::next_id(),
+                            command: *b"DB",
+                            data: [0u8; 256],
+                            data_length: 0,
+                        };
+                        let mut buf = [0u8; 512];
+                        frame.tx(&mut buf).await;
+                        let resp = frame.await_response_timeout(3).await;
+                        if let Some(APIFrame::LocalCommandResponse {
+                            data: LocalCommandResponseData::RSSI { rssi },
+                            ..
+                        }) = resp
+                        {
+                            write!(get_serial(), "rssi|{}\n", rssi).unwrap();
+                        }
                     }
                     radio::Message::SetLaunchT(t) => {
                         self.launch_t.replace(t);
                         if Self::is_ground_station() {
-                            write!(get_serial(), "newt,{}\n", t).unwrap();
+                            write!(get_serial(), "newt|{}\n", t).unwrap();
                         } else {
                             get_logger().log(format_args!("New launch time {}z", t));
                         }
@@ -255,6 +286,7 @@ impl MissionState {
                 YieldFuture::new().await;
             }
         } else {
+            rickroll_everyone().await;
         }
     }
 
@@ -287,6 +319,7 @@ impl MissionState {
                             "{:x} entering stage {:?}",
                             source_address, stage
                         ));
+                        write!(get_serial(), "stgc|{:?}\n", stage).unwrap();
                         ready_count += 1;
                         if ready_count == ascent_nodes {
                             break;
@@ -312,8 +345,8 @@ impl MissionState {
                 };
                 let mut buf = [0; 256];
                 tx_req.tx(&mut buf).await;
-                match tx_req.await_response().await {
-                    APIFrame::ExtendedTransmitStatus { status, .. } => {
+                match tx_req.await_response_timeout(5).await {
+                    Some(APIFrame::ExtendedTransmitStatus { status, .. }) => {
                         if status == 0 {
                             break;
                         }
@@ -356,6 +389,12 @@ impl MissionState {
                     FORCE_ADVANCE_STAGE.store(false, Ordering::SeqCst);
                     break;
                 }
+
+                if get_timestamp() - self.launch_t.get() > ASCENT_TIMEOUT {
+                    get_logger().log_str("warn: ascent timeout");
+                    break;
+                }
+
                 YieldFuture::new().await;
             }
         }
@@ -385,6 +424,12 @@ impl MissionState {
                 FORCE_ADVANCE_STAGE.store(false, Ordering::SeqCst);
                 break;
             }
+
+            if get_timestamp() - self.launch_t.get() > DESCENT_TIMEOUT {
+                get_logger().log_str("warn: ascent timeout");
+                break;
+            }
+
             YieldFuture::new().await;
         }
     }
@@ -460,14 +505,22 @@ impl MissionState {
     }
 
     async fn wait_for_gps(&self) {
-        gps::tx(b"$PMTK251,115200*1F\r\n").await;
-        gps::change_baudrate(115200).await;
-        for _ in 0..10 {
-            gps::tx(b"$PMTK220,100*2F\r\n").await;
+        //gps::tx(b"$PMTK251,115200*1F\r\n").await;
+        //gps::change_baudrate(115200).await;
+        for _ in 0..1 {
+            gps::tx(b"$PMTK220,500*2F\r\n").await;
         }
         while !GPS_HAS_FIX.load(Ordering::SeqCst) {
             YieldFuture::new().await;
         }
+    }
+
+    fn address(&self) -> u64 {
+        return *NODES
+            .keys()
+            .filter(|key| NODES[key] == NODE_TYPE)
+            .next()
+            .unwrap();
     }
 
     async fn handle_usb_communication(&self) {
@@ -480,14 +533,14 @@ impl MissionState {
                     if line.starts_with(b"ping") {
                         get_serial().write(b"pong\n").await;
                     } else if line.starts_with(b"sett") {
-                        let t = line.split(|t| *t == ',' as u8);
+                        let t = line.split(|t| *t == '|' as u8);
                         let t = core::str::from_utf8(t.skip(1).next().unwrap()).unwrap();
                         let t = i64::from_str_radix(t, 10).unwrap();
                         get_logger().log(format_args!("Launch T is {}", t));
                         self.launch_t.replace(t);
                         self.inform_new_t(t).await;
                     } else if line.starts_with(b"curt") {
-                        let t = line.split(|t| *t == ',' as u8);
+                        let t = line.split(|t| *t == '|' as u8);
                         let t = core::str::from_utf8(t.skip(1).next().unwrap()).unwrap();
                         let t = i64::from_str_radix(t, 10).unwrap();
                         get_logger().log(format_args!("Current time is {}", t));
@@ -500,6 +553,89 @@ impl MissionState {
                             );
                             rtc.as_mut().unwrap().set_datetime(&date_time).unwrap();
                         });
+                    } else if line.starts_with(b"pgri") {
+                        let address = line.split(|t| *t == '|' as u8);
+                        let address =
+                            core::str::from_utf8(address.skip(1).next().unwrap()).unwrap();
+                        let address = u64::from_str_radix(address, 16).unwrap();
+                        get_logger().log(format_args!("Pinging {:x} with route info", address));
+
+                        let mut pong_recieved = false;
+                        while !pong_recieved {
+                            let id = radio::next_id();
+                            let mut buf = radio::Message::Ping(id).data();
+                            let api_frame = radio::APIFrame::TransmitRequest {
+                                frame_id: id,
+                                destination_address: address,
+                                broadcast_radius: 0,
+                                transmit_options: 0xC8, // Request route info
+                                data: buf,
+                            };
+                            let mut buf2 = [0u8; 512];
+                            api_frame.tx(&mut buf2).await;
+
+                            radio::claim_frame_timeout(
+                                |frame| match frame {
+                                    radio::APIFrame::ReceivePacket {
+                                        source_address,
+                                        message,
+                                        payload,
+                                        ..
+                                    } => match message {
+                                        Some(radio::Message::Pong(x)) => {
+                                            if *source_address == address && *x == id {
+                                                hprintln!("Pong from {:x}", source_address);
+                                                get_logger().log(format_args!(
+                                                    "info: Pong from {:x}",
+                                                    source_address
+                                                ));
+                                                pong_recieved = true;
+                                                true
+                                            } else {
+                                                false
+                                            }
+                                        }
+                                        _ => false,
+                                    },
+
+                                    _ => false,
+                                },
+                                10,
+                            )
+                            .await;
+                            api_frame.await_response().await; // discard tx status
+                        }
+
+                        let mut route = Vec::<u64, 8>::new();
+                        let mut current = self.address();
+                        route.push(current);
+
+                        loop {
+                            radio::claim_frame(|frame| match frame {
+                                radio::APIFrame::RouteInfo {
+                                    responder,
+                                    receiver,
+                                    ..
+                                } => {
+                                    if *responder == current {
+                                        route.push(*receiver);
+                                        current = *receiver;
+                                        get_logger().log(format_args!("Receiver: {:x}", receiver));
+                                        true
+                                    } else {
+                                        false
+                                    }
+                                }
+                                _ => false,
+                            })
+                            .await;
+
+                            if current == address {
+                                break;
+                            }
+                        }
+
+                        write!(get_serial(), "rtin|{:016x?}\n", &route[..]);
                     } else {
                         hprintln!("Unknown message {:?}", line);
                     }
@@ -542,7 +678,7 @@ impl MissionState {
     }
 
     async fn discover_network(self: &Self) {
-        self.radio_discover().await;
+        // self.radio_discover().await;
         self.radio_ping_all().await;
     }
 
@@ -555,7 +691,14 @@ impl MissionState {
             let parse_result = gps::next_sentence().await;
             match parse_result {
                 nmea0183::ParseResult::RMC(Some(rmc)) => {
-                    get_logger().log(format_args!("RMC: {:?}", rmc));
+                    get_logger().log(format_args!(
+                        "RMC: {},{},{},{},{:?}",
+                        rmc.latitude.as_f64(),
+                        rmc.longitude.as_f64(),
+                        rmc.speed.as_mps(),
+                        rmc.course.map_or(0.0, |x| x.degrees),
+                        rmc.mode
+                    ));
                     //hprintln!("RMC: {:?}", rmc);
 
                     if !GPS_HAS_FIX.load(Ordering::SeqCst) {
@@ -587,7 +730,14 @@ impl MissionState {
                     }
                 }
                 nmea0183::ParseResult::GGA(Some(gga)) => {
-                    get_logger().log(format_args!("GGA: {:?}", gga));
+                    get_logger().log(format_args!(
+                        "GGA: {},{},{},{},{:?}",
+                        gga.latitude.as_f64(),
+                        gga.longitude.as_f64(),
+                        gga.altitude.meters as f64,
+                        gga.hdop,
+                        gga.gps_quality,
+                    ));
                     //hprintln!("GGA: {:?}", gga);
                     lat_readings[index] = gga.latitude.as_f64();
                     long_readings[index] = gga.longitude.as_f64();
@@ -595,24 +745,26 @@ impl MissionState {
                     index += 1;
                     if index == 8 {
                         index = 0;
-                        let msg = radio::Message::Gps {
-                            timestamp: get_timestamp(),
-                            lat: lat_readings,
-                            long: long_readings,
-                            alt: alt_readings,
-                        };
-                        let mut buf = [0u8; 256];
-                        let ground_stations = Self::get_ground_stations();
-                        for gs in ground_stations {
-                            let tx = radio::APIFrame::TransmitRequest {
-                                frame_id: radio::next_id(),
-                                destination_address: gs,
-                                broadcast_radius: 0,
-                                transmit_options: 0,
-                                data: msg.data(),
+                        if self.should_send_sensor_data() {
+                            let msg = radio::Message::Gps {
+                                timestamp: get_timestamp(),
+                                lat: lat_readings,
+                                long: long_readings,
+                                alt: alt_readings,
                             };
-                            tx.tx(&mut buf).await;
-                            tx.await_response().await;
+                            let mut buf = [0u8; 256];
+                            let ground_stations = Self::get_ground_stations();
+                            for gs in ground_stations {
+                                let tx = radio::APIFrame::TransmitRequest {
+                                    frame_id: radio::next_id(),
+                                    destination_address: gs,
+                                    broadcast_radius: 0,
+                                    transmit_options: 0,
+                                    data: msg.data(),
+                                };
+                                tx.tx(&mut buf).await;
+                                tx.await_response().await;
+                            }
                         }
                     }
                 }
@@ -698,14 +850,14 @@ impl MissionState {
                 let mut buf2 = [0u8; 512];
                 api_frame.tx(&mut buf2).await;
 
-                radio::claim_frame(|frame| match frame {
-                    radio::APIFrame::ReceivePacket {
-                        source_address,
-                        message,
-                        payload,
-                        ..
-                    } => {
-                        match message {
+                radio::claim_frame_timeout(
+                    |frame| match frame {
+                        radio::APIFrame::ReceivePacket {
+                            source_address,
+                            message,
+                            payload,
+                            ..
+                        } => match message {
                             Some(radio::Message::Pong(x)) => {
                                 if *source_address == peer && *x == id {
                                     hprintln!("Pong from {:x}", source_address);
@@ -718,11 +870,12 @@ impl MissionState {
                                 }
                             }
                             _ => false,
-                        }
-                    }
+                        },
 
-                    _ => false,
-                })
+                        _ => false,
+                    },
+                    10,
+                )
                 .await;
                 api_frame.await_response().await; // discard tx status
             }
@@ -793,12 +946,11 @@ impl MissionState {
                         let resp = frame.await_response().await; // for now discard response
                         hprintln!("info: Sent sensor data to {:x}. {:?}", *gs, resp);
                     }
-
-                    get_logger().log(format_args!(
-                        "PTA: {{ pressure: {:?}, temp: {:?} }}",
-                        pressure_readings, temperature_readings
-                    ));
                 }
+                get_logger().log(format_args!(
+                    "PTA: {{ pressure: {:?}, temp: {:?} }}",
+                    pressure_readings, temperature_readings
+                ));
             }
             NbFuture::new(|| timer.wait()).await.unwrap();
         }

@@ -107,14 +107,14 @@ impl SdLogger {
     }
 
     pub fn log(&mut self, fmt: fmt::Arguments) {
-        let mut buf = [0u8; 512];
+        let mut buf = [0u8; 1024];
         let mut buf = FixedWriter(&mut buf, 0);
         write!(buf, "{}", fmt).unwrap();
         self.log_str(unsafe { core::str::from_utf8_unchecked(&buf.0[..buf.1]) })
     }
 
     pub fn log_str(&mut self, msg: &str) {
-        let mut buf = [0u8; 32];
+        let mut buf = [0u8; 1024];
         let mut buf = FixedWriter(&mut buf, 0);
 
         let ((h, m, s), millis) = cortex_m::interrupt::free(|cs| {
@@ -158,7 +158,7 @@ impl Logger {
             Some(sd_logger) => sd_logger.log(fmt),
             None => {
                 get_serial()
-                    .write_fmt(format_args!("logs,{}\n", fmt))
+                    .write_fmt(format_args!("logs|{}\n", fmt))
                     .unwrap();
             }
         }
@@ -169,7 +169,7 @@ impl Logger {
             Some(sd_logger) => sd_logger.log_str(msg),
             None => {
                 get_serial()
-                    .write_fmt(format_args!("logs,{}\n", msg))
+                    .write_fmt(format_args!("logs|{}\n", msg))
                     .unwrap();
             }
         }

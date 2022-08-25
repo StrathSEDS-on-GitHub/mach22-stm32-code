@@ -4,9 +4,9 @@
 
 use crate::hal::timer::TimerExt;
 use crate::mission::MissionState;
+use crate::rickroll::rickroll_everyone;
 use crate::rickroll::RickRollPeripherals;
 use crate::rickroll::RICK_ROLL_PERIPHERALS;
-use crate::rickroll::rickroll_everyone;
 use crate::sdcard::get_logger;
 use crate::sdcard::SdLogger;
 use crate::usb_serial::setup_usb;
@@ -108,14 +108,45 @@ async fn main() {
 
         assert!(clocks.is_pll48clk_valid());
 
-        setup_usb(
-            dp.OTG_FS_GLOBAL,
-            dp.OTG_FS_DEVICE,
-            dp.OTG_FS_PWRCLK,
-            gpioa.pa11,
-            gpioa.pa12,
-            &clocks,
-        );
+        let mut button = gpioa.pa0.into_pull_up_input();
+
+        let mut syscfg = dp.SYSCFG.constrain();
+        button.make_interrupt_source(&mut syscfg);
+        button.enable_interrupt(&mut dp.EXTI);
+        button.trigger_on_edge(&mut dp.EXTI, Edge::Rising);
+        let btn_int_num = button.interrupt();
+        pac::NVIC::unpend(btn_int_num);
+
+        let counter = dp.TIM5.counter_us(&clocks);
+        let pin = gpioa.pa1.into_alternate();
+        let led = gpioa
+            .pa5
+            .internal_pull_down(true)
+            .into_push_pull_output_in_state(PinState::Low);
+        let pwm = dp.TIM2.pwm_hz(pin, (96 / 4).MHz(), &clocks).split();
+
+        // SAFETY: We are not in a CS so we can safely unmask interrupts.
+        unsafe {
+            pac::NVIC::unmask(btn_int_num);
+        };
+
+        cortex_m::interrupt::free(|cs| {
+            // SAFETY: Mutex makes access of static mutable variable safe
+            unsafe { USER_BUTTON.borrow(cs) }.replace(Some(button));
+            unsafe { RICK_ROLL_PERIPHERALS.borrow(cs) }
+                .replace(Some(RickRollPeripherals::new(led, counter, pwm)));
+        });
+
+        if matches!(mission::NODE_TYPE, mission::NodeType::GroundStation(..)) {
+            setup_usb(
+                dp.OTG_FS_GLOBAL,
+                dp.OTG_FS_DEVICE,
+                dp.OTG_FS_PWRCLK,
+                gpioa.pa11,
+                gpioa.pa12,
+                &clocks,
+            );
+        }
 
         let mut delay = cp.SYST.delay(&clocks);
 
@@ -148,31 +179,6 @@ async fn main() {
             unsafe { RTC.borrow(cs).replace(Some(rtc)) }
         });
 
-        let mut syscfg = dp.SYSCFG.constrain();
-        let mut button = gpioa.pa0.into_pull_up_input();
-
-        button.make_interrupt_source(&mut syscfg);
-        button.enable_interrupt(&mut dp.EXTI);
-        button.trigger_on_edge(&mut dp.EXTI, Edge::Rising);
-        let btn_int_num = button.interrupt();
-        pac::NVIC::unpend(btn_int_num);
-
-        let counter = dp.TIM5.counter_us(&clocks);
-        let pin = gpioa.pa1.into_alternate();
-        let led = gpioa.pa5.internal_pull_down(true).into_push_pull_output_in_state(PinState::Low);
-        let pwm = dp.TIM2.pwm_hz(pin, (96/4).MHz(), &clocks).split();
-
-        // SAFETY: We are not in a CS so we can safely unmask interrupts.
-        unsafe {
-            pac::NVIC::unmask(btn_int_num);
-        };
-
-        cortex_m::interrupt::free(|cs| {
-            // SAFETY: Mutex makes access of static mutable variable safe
-            unsafe { USER_BUTTON.borrow(cs) }.replace(Some(button));
-            unsafe { RICK_ROLL_PERIPHERALS.borrow(cs) }
-                .replace(Some(RickRollPeripherals::new(led, counter, pwm)));
-        });
 
         // let mut i2c1 = I2c::new(dp.I2C1, (gpiob.pb6, gpiob.pb7), 100.kHz(), &clocks);
         let i2c2 = I2c::new(dp.I2C2, (gpiob.pb10, gpiob.pb9), 100.kHz(), &clocks);
