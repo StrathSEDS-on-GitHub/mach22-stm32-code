@@ -119,7 +119,7 @@ impl SdLogger {
 
         let ((h, m, s), millis) = cortex_m::interrupt::free(|cs| {
             // SAFETY: Mutex makes access of static mutable variable safe
-            let mut borrow = unsafe { RTC.borrow(cs) }.borrow_mut();
+            let mut borrow = RTC.borrow(cs).borrow_mut();
             let hms = borrow.as_mut().unwrap().get_datetime().as_hms();
 
             let ss = unsafe { &*stm32f4xx_hal::pac::RTC::ptr() }

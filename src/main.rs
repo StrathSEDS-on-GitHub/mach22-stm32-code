@@ -47,16 +47,16 @@ mod rickroll;
 mod sdcard;
 mod usb_serial;
 
-static mut ERROR_LED: Mutex<RefCell<Option<gpio::Pin<'C', 13, Output<PushPull>>>>> =
+static ERROR_LED: Mutex<RefCell<Option<gpio::Pin<'C', 13, Output<PushPull>>>>> =
     Mutex::new(RefCell::new(None));
-static mut USER_BUTTON: Mutex<RefCell<Option<gpio::Pin<'A', 0, Input>>>> =
+static USER_BUTTON: Mutex<RefCell<Option<gpio::Pin<'A', 0, Input>>>> =
     Mutex::new(RefCell::new(None));
 
-static mut RTC: Mutex<RefCell<Option<Rtc>>> = Mutex::new(RefCell::new(None));
+static RTC: Mutex<RefCell<Option<Rtc>>> = Mutex::new(RefCell::new(None));
 
 fn get_timestamp() -> i64 {
     cortex_m::interrupt::free(|cs| {
-        let mut rtc_ref = unsafe { crate::RTC.borrow(cs) }.borrow_mut();
+        let mut rtc_ref = crate::RTC.borrow(cs).borrow_mut();
         rtc_ref
             .as_mut()
             .unwrap()
@@ -90,7 +90,7 @@ async fn main() {
 
         cortex_m::interrupt::free(|cs| {
             // SAFETY: Mutex makes access of static mutable variable safe
-            unsafe { ERROR_LED.borrow(cs) }
+            ERROR_LED.borrow(cs)
                 .replace(Some(dp.GPIOC.split().pc13.into_push_pull_output()));
         });
 
@@ -132,8 +132,8 @@ async fn main() {
 
         cortex_m::interrupt::free(|cs| {
             // SAFETY: Mutex makes access of static mutable variable safe
-            unsafe { USER_BUTTON.borrow(cs) }.replace(Some(button));
-            unsafe { RICK_ROLL_PERIPHERALS.borrow(cs) }
+            USER_BUTTON.borrow(cs).replace(Some(button));
+            RICK_ROLL_PERIPHERALS.borrow(cs)
                 .replace(Some(RickRollPeripherals::new(led, counter, pwm)));
         });
 
@@ -176,7 +176,7 @@ async fn main() {
         let rtc = Rtc::new(dp.RTC, &mut dp.PWR);
         cortex_m::interrupt::free(|cs| {
             // SAFETY: Mutex makes access of static mutable variable safe
-            unsafe { RTC.borrow(cs).replace(Some(rtc)) }
+            RTC.borrow(cs).replace(Some(rtc))
         });
 
 
@@ -240,7 +240,7 @@ async fn main() {
 pub fn panic(info: &PanicInfo) -> ! {
     cortex_m::interrupt::free(|cs| {
         // SAFETY: Mutex makes access of static mutable variable safe
-        let mut led = unsafe { ERROR_LED.borrow(cs).borrow_mut() };
+        let mut led = ERROR_LED.borrow(cs).borrow_mut();
         if let Some(led) = led.as_mut() {
             led.set_high();
         }

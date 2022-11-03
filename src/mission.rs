@@ -437,7 +437,7 @@ impl MissionState {
     async fn wait_for_launch_t(&self) {
         loop {
             let (current_time, launch_t) = cortex_m::interrupt::free(|cs| {
-                let mut rtc_ref = unsafe { crate::RTC.borrow(cs) }.borrow_mut();
+                let mut rtc_ref = crate::RTC.borrow(cs).borrow_mut();
                 let rtc = rtc_ref.as_mut().unwrap();
                 let current_time = rtc.get_datetime().assume_utc().unix_timestamp();
                 let launch_t = self.launch_t.get();
@@ -545,7 +545,7 @@ impl MissionState {
                         let t = i64::from_str_radix(t, 10).unwrap();
                         get_logger().log(format_args!("Current time is {}", t));
                         cortex_m::interrupt::free(|cs| {
-                            let mut rtc = unsafe { crate::RTC.borrow(cs) }.borrow_mut();
+                            let mut rtc = crate::RTC.borrow(cs).borrow_mut();
                             let offset_date_time = OffsetDateTime::from_unix_timestamp(t).unwrap();
                             let date_time = PrimitiveDateTime::new(
                                 offset_date_time.date(),
@@ -705,7 +705,7 @@ impl MissionState {
                         let time = rmc.datetime.time;
                         let date = rmc.datetime.date;
                         cortex_m::interrupt::free(|cs| {
-                            let mut rtc_ref = unsafe { crate::RTC.borrow(cs) }.borrow_mut();
+                            let mut rtc_ref = crate::RTC.borrow(cs).borrow_mut();
                             let rtc = rtc_ref.as_mut().unwrap();
 
                             let date_time = PrimitiveDateTime::new(
@@ -991,7 +991,7 @@ fn EXTI0() {
     cortex_m::interrupt::free(|cs|
         // SAFETY: Mutex makes access of static mutable variable safe
         {
-            let mut btn_ref = unsafe { crate::USER_BUTTON.borrow(cs) }.borrow_mut();
+            let mut btn_ref = crate::USER_BUTTON.borrow(cs).borrow_mut();
             let btn = btn_ref.as_mut().unwrap();
             btn.clear_interrupt_pending_bit();
             FORCE_ADVANCE_STAGE.store(true, Ordering::SeqCst);

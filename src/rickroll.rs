@@ -21,7 +21,7 @@ impl RickRollPeripherals {
     }
 }
 
-pub static mut RICK_ROLL_PERIPHERALS: Mutex<RefCell<Option<RickRollPeripherals>>> = Mutex::new(RefCell::new(None));
+pub static RICK_ROLL_PERIPHERALS: Mutex<RefCell<Option<RickRollPeripherals>>> = Mutex::new(RefCell::new(None));
 
 const TEMPO: i32 = 114;
 const MELODY: &[i32] = &[
@@ -58,7 +58,7 @@ const MELODY: &[i32] = &[
 ];
 
 pub async fn rickroll_everyone() {
-    let (mut led, mut counter, mut pwm) = cortex_m::interrupt::free(|cs| unsafe {
+    let (mut led, mut counter, mut pwm) = cortex_m::interrupt::free(|cs| {
         let p = RICK_ROLL_PERIPHERALS
             .borrow(cs)
             .borrow_mut()
