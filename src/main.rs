@@ -164,11 +164,8 @@ async fn main() {
         let rcc = dp.RCC.constrain();
         let clocks = rcc
             .cfgr
-            .use_hse(16.MHz())
-            .sysclk(96.MHz())
+            .sysclk(48.MHz())
             .require_pll48clk()
-            .pclk1(42.MHz())
-            .pclk2(84.MHz())
             .freeze();
 
         assert!(clocks.is_pll48clk_valid());
@@ -244,7 +241,7 @@ async fn main() {
         let f1 = report_sensor_data(i2c1, i2c2, timer);
         let timer = dp.TIM3.counter_ms(&clocks);
 
-        let serial = dp.USART2.serial((gpioa.pa2.into_alternate(), gpioa.pa3.into_alternate()), 9600.bps(), &clocks).unwrap();
+        let serial = dp.USART2.serial((gpioa.pa2.into_alternate(), gpioa.pa3.into_alternate()), hal::serial::Config::from(9600.bps()).parity_none().stopbits(hal::serial::config::StopBits::STOP1), &clocks).unwrap();
 
         let f2 = radio_serial(serial, led, timer);
         //let f3 = rickroll_everyone(pwm, counter, led);

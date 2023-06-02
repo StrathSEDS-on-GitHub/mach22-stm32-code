@@ -22,4 +22,4 @@ usbd-serial = "0.1.0"
 
 [dependencies.stm32f4xx-hal]
 version = "0.13.2"
-features = ["rt", "stm32f411", "sdio", "sdio-host", "usb_fs"] # replace the model of your microcontroller here
+features = ["rt", "stm32f412", "sdio", "sdio-host", "usb_fs"] # replace the model of your microcontroller here
