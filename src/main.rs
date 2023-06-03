@@ -229,83 +229,18 @@ async fn main() {
             unsafe { USER_BUTTON.borrow(cs) }.replace(Some(button));
         });
         
-        let counter = dp.TIM5.counter_hz(&clocks);
-        let pin = gpioa.pa1.into_alternate();
-        let led = gpioa.pa5.into_push_pull_output();
-        let pwm = dp.TIM2.pwm_hz(pin, 100.kHz(), &clocks).split();
-        
 
-        let timer = dp.TIM4.counter_ms(&clocks);
-        let i2c1 = I2c::new(dp.I2C1, (gpiob.pb6, gpiob.pb7), 100.kHz(), &clocks);
-        let i2c2 = I2c::new(dp.I2C2, (gpiob.pb10, gpiob.pb9), 100.kHz(), &clocks);
-        let f1 = report_sensor_data(i2c1, i2c2, timer);
         let timer = dp.TIM3.counter_ms(&clocks);
 
         let serial = dp.USART2.serial((gpioa.pa2.into_alternate(), gpioa.pa3.into_alternate()), hal::serial::Config::from(9600.bps()).parity_none().stopbits(hal::serial::config::StopBits::STOP1), &clocks).unwrap();
 
-        let f2 = radio_serial(serial, led, timer);
+        let f2 = radio_serial(serial, timer);
         //let f3 = rickroll_everyone(pwm, counter, led);
 
         f2.await;
     }
 }
 
-async fn rickroll_everyone<const C: u8, LedPin: OutputPin, E: Debug>(mut pwm: timer::PwmChannel<pac::TIM2, C>, mut counter: timer::CounterHz<pac::TIM5>, mut led: LedPin) 
-where LedPin: OutputPin<Error = E> {
-    let chunks = MELODY.chunks(2);
-    let note_length_ms: i32 = 60000 * 4 / TEMPO;
-    pwm.enable();
-    for note_and_duration in chunks {
-        loop {
-            let should_rickroll = cortex_m::interrupt::free(|cs| { 
-                // SAFETY: Mutex makes access of static mutable variable safe
-                unsafe { *SHOULD_RICKROLL.borrow(cs).borrow() }
-            });
-            if should_rickroll {
-                break;
-            } else {
-                YieldFuture::new().await;
-            }
-        }
-
-        let (note, divider) = (note_and_duration[0], note_and_duration[1]);
-        // calculates the duration of each note
-        let note_duration = if divider > 0 {
-          // regular note, just proceed
-            (note_length_ms) / divider
-        } else {
-          // dotted notes are represented with negative durations!!
-          (note_length_ms)  * 3 / (-divider) / 2
-        };
-
-
-        if note == 0 {
-            counter.start(max((1_000/note_duration) as u32, 1).kHz()).unwrap();
-            NbFuture::new(|| counter.wait()).await.unwrap();
-            continue;
-        }
-
-        counter.start(((note * 2) as u32).Hz()).unwrap();
-        let mut pulse = false;
-        let mut n = 0;
-        loop {
-            if pulse {
-                pwm.set_duty(pwm.get_max_duty());
-                led.set_high().unwrap();
-            } else {
-                pwm.set_duty(0);
-                led.set_low().unwrap();
-            }
-            NbFuture::new(|| counter.wait()).await.unwrap();
-            pulse = if 1000 * n / (note * 2) >= note_duration * 8 / 10 { false } else { !pulse };
-            n += 1;
-
-            if 1000 * n / (note * 2) >= note_duration {
-                break;
-            }
-        }
-    }
-}
 
 #[interrupt]
 fn EXTI0() {
@@ -320,25 +255,22 @@ fn EXTI0() {
     });
 }
 
-async fn radio_serial<TIM, PINS, const P: char, const T: u8>(
+async fn radio_serial<TIM, PINS>(
     serial: Serial<USART2, PINS, u8>,
-    mut led: Pin<P, T, Output<PushPull>>,
     mut timer: CounterMs<TIM>,
 ) where
     TIM: timer::Instance,
 {
-    timer.start(8.millis()).unwrap();
+    timer.start(4.millis()).unwrap();
     let (mut tx, mut rx) = serial.split();
 
     loop {
         match rx.read() {
             Ok(byte) => {
-                led.set_high();
                 //hprintln!("read?");
                 //hprint!("{}", byte as char);
                 //hprintln!("Received: {}", byte);
                 get_serial().write(&[byte]).await;
-                led.set_low();
             }
             Err(nb::Error::WouldBlock) => {
                 //hprintln!("Would block {}", rx.is_idle());
